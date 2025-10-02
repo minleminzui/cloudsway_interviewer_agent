@@ -1,0 +1,1868 @@
+diff --git a/backend/__init__.py b/backend/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/backend/app/__init__.py b/backend/app/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/backend/app/config.py b/backend/app/config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..621bac8a7ef1dd30a1632b69bd4779eaea783259
+--- /dev/null
++++ b/backend/app/config.py
+@@ -0,0 +1,35 @@
++from __future__ import annotations
++
++from functools import lru_cache
++from typing import List
++
++from pydantic import Field
++from pydantic_settings import BaseSettings, SettingsConfigDict
++
++
++class Settings(BaseSettings):
++    """Application runtime configuration."""
++
++    app_name: str = Field(default="interviewer-agent-backend", alias="APP_NAME")
++    environment: str = Field(default="development", alias="ENVIRONMENT")
++    database_url: str = Field(default="sqlite+aiosqlite:///./interviewer.db", alias="DATABASE_URL")
++    allow_origins_raw: str | None = Field(default=None, alias="ALLOW_ORIGINS")
++    asr_upstream_url: str | None = Field(default=None, alias="ASR_UPSTREAM_URL")
++    tts_upstream_url: str | None = Field(default=None, alias="TTS_UPSTREAM_URL")
++    llm_upstream_url: str | None = Field(default=None, alias="LLM_UPSTREAM_URL")
++
++    model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
++
++    @property
++    def allow_origins(self) -> List[str]:
++        if not self.allow_origins_raw:
++            return ["http://localhost:5173", "http://127.0.0.1:5173"]
++        return [origin.strip() for origin in self.allow_origins_raw.split(",") if origin.strip()]
++
++
++@lru_cache
++def get_settings() -> Settings:
++    return Settings()
++
++
++settings = get_settings()
+diff --git a/backend/app/database.py b/backend/app/database.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e5c865c6171d1c73c25e8776148ac1ea30925a1
+--- /dev/null
++++ b/backend/app/database.py
+@@ -0,0 +1,27 @@
++from __future__ import annotations
++
++from typing import AsyncGenerator
++
++from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
++
++from .config import settings
++
++
++engine = create_async_engine(settings.database_url, echo=False, future=True)
++SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
++
++
++async def get_session() -> AsyncGenerator[AsyncSession, None]:
++    async with SessionLocal() as session:  # type: ignore[misc]
++        yield session
++
++
++async def init_models() -> None:
++    from . import models  # noqa: WPS433
++
++    async with engine.begin() as conn:
++        await conn.run_sync(models.Base.metadata.create_all)
++
++
++async def shutdown() -> None:
++    await engine.dispose()
+diff --git a/backend/app/main.py b/backend/app/main.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..75ee1ee1542810bad5b98b988a7cb1e74e62cf4c
+--- /dev/null
++++ b/backend/app/main.py
+@@ -0,0 +1,32 @@
++from __future__ import annotations
++
++from fastapi import FastAPI
++from fastapi.middleware.cors import CORSMiddleware
++
++from .config import settings
++from .database import init_models, shutdown
++from .routers import http_api, ws_agent, ws_asr, ws_tts
++
++app = FastAPI(title=settings.app_name)
++app.add_middleware(
++    CORSMiddleware,
++    allow_origins=settings.allow_origins,
++    allow_credentials=True,
++    allow_methods=["*"],
++    allow_headers=["*"],
++)
++
++app.include_router(http_api.router, prefix="/v1", tags=["http"])
++app.include_router(ws_agent.router, tags=["ws"])
++app.include_router(ws_asr.router, tags=["ws"])
++app.include_router(ws_tts.router, tags=["ws"])
++
++
++@app.on_event("startup")
++async def on_startup() -> None:
++    await init_models()
++
++
++@app.on_event("shutdown")
++async def on_shutdown() -> None:
++    await shutdown()
+diff --git a/backend/app/models.py b/backend/app/models.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2774c0890de6315a47b39c4acec51a9019aa980
+--- /dev/null
++++ b/backend/app/models.py
+@@ -0,0 +1,54 @@
++from __future__ import annotations
++
++from datetime import datetime
++from typing import Optional
++
++from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
++from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
++
++
++class Base(DeclarativeBase):
++    pass
++
++
++class Session(Base):
++    __tablename__ = "sessions"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
++    topic: Mapped[str] = mapped_column(String(255))
++    interviewer: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
++    interviewee: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
++    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
++    status: Mapped[str] = mapped_column(String(32), default="active")
++    metadata_json: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
++
++    turns: Mapped[list["Turn"]] = relationship(back_populates="session", cascade="all, delete-orphan")
++    notes: Mapped[list["Note"]] = relationship(back_populates="session", cascade="all, delete-orphan")
++
++
++class Turn(Base):
++    __tablename__ = "turns"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
++    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
++    speaker: Mapped[str] = mapped_column(String(32))
++    transcript: Mapped[str] = mapped_column(Text)
++    stage: Mapped[str] = mapped_column(String(32))
++    llm_action: Mapped[str] = mapped_column(String(32))
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
++
++    session: Mapped[Session] = relationship(back_populates="turns")
++
++
++class Note(Base):
++    __tablename__ = "notes"
++
++    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
++    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
++    category: Mapped[str] = mapped_column(String(64))
++    content: Mapped[str] = mapped_column(Text)
++    confidence: Mapped[float] = mapped_column(default=1.0)
++    requires_clarification: Mapped[bool] = mapped_column(default=False)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
++
++    session: Mapped[Session] = relationship(back_populates="notes")
+diff --git a/backend/app/routers/__init__.py b/backend/app/routers/__init__.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..329c30b6e8180c2d415b7ac5e51d98be094a03f2
+--- /dev/null
++++ b/backend/app/routers/__init__.py
+@@ -0,0 +1,3 @@
++from . import http_api, ws_agent, ws_asr, ws_tts
++
++__all__ = ["http_api", "ws_agent", "ws_asr", "ws_tts"]
+diff --git a/backend/app/routers/http_api.py b/backend/app/routers/http_api.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a945b0d89ca49e9b6c78ac8c69834bc40c482a1f
+--- /dev/null
++++ b/backend/app/routers/http_api.py
+@@ -0,0 +1,99 @@
++from __future__ import annotations
++
++import io
++from typing import List
++
++from fastapi import APIRouter, Depends, HTTPException
++from fastapi.responses import StreamingResponse
++from sqlalchemy import select
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from ..database import get_session
++from ..models import Note, Session, Turn
++from ..schemas import ExportRequest, PlanResponse, SessionCreate, SessionCreateResponse, SessionSchema
++from ..services.outline import outline_builder
++
++router = APIRouter()
++
++
++@router.post("/sessions", response_model=SessionCreateResponse)
++async def create_session(payload: SessionCreate, db: AsyncSession = Depends(get_session)) -> SessionCreateResponse:
++    session = Session(topic=payload.topic, interviewer=payload.interviewer, interviewee=payload.interviewee)
++    db.add(session)
++    await db.commit()
++    await db.refresh(session)
++    outline = outline_builder.build(payload.topic)
++    return SessionCreateResponse(session=session, outline=outline)
++
++
++@router.get("/sessions", response_model=List[SessionSchema])
++async def list_sessions(db: AsyncSession = Depends(get_session)) -> List[SessionSchema]:
++    result = await db.execute(select(Session))
++    return list(result.scalars())
++
++
++@router.get("/sessions/{session_id}", response_model=SessionSchema)
++async def get_session_detail(session_id: int, db: AsyncSession = Depends(get_session)) -> SessionSchema:
++    session = await db.get(Session, session_id)
++    if not session:
++        raise HTTPException(status_code=404, detail="Session not found")
++    return session
++
++
++@router.post("/plan", response_model=PlanResponse)
++async def generate_plan(payload: SessionCreate) -> PlanResponse:
++    return outline_builder.build(payload.topic)
++
++
++@router.post("/export")
++async def export_summary(payload: ExportRequest, db: AsyncSession = Depends(get_session)) -> StreamingResponse:
++    session = await db.get(Session, payload.session_id)
++    if not session:
++        raise HTTPException(status_code=404, detail="Session not found")
++    turns = await db.execute(select(Turn).where(Turn.session_id == payload.session_id))
++    notes = await db.execute(select(Note).where(Note.session_id == payload.session_id))
++    turn_rows = list(turns.scalars())
++    note_rows = list(notes.scalars())
++    if payload.format == "docx":
++        from docx import Document
++
++        document = Document()
++        document.add_heading(f"采访纪要 - {session.topic}", level=1)
++        for turn in turn_rows:
++            document.add_heading(f"{turn.speaker} ({turn.stage})", level=2)
++            document.add_paragraph(turn.transcript)
++        document.add_heading("要点", level=2)
++        for note in note_rows:
++            document.add_paragraph(f"[{note.category}] {note.content}")
++        buffer = io.BytesIO()
++        document.save(buffer)
++        buffer.seek(0)
++        filename = f"session-{session.id}.docx"
++        return StreamingResponse(
++            buffer,
++            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
++            headers={"Content-Disposition": f"attachment; filename={filename}"},
++        )
++    if payload.format == "xlsx":
++        from openpyxl import Workbook
++
++        wb = Workbook()
++        ws = wb.active
++        ws.title = "Turns"
++        ws.append(["Speaker", "Stage", "Transcript"])
++        for turn in turn_rows:
++            ws.append([turn.speaker, turn.stage, turn.transcript])
++        ws_notes = wb.create_sheet("Notes")
++        ws_notes.append(["Category", "Content", "Confidence", "Need Clarify"])
++        for note in note_rows:
++            ws_notes.append([note.category, note.content, note.confidence, note.requires_clarification])
++        buffer = io.BytesIO()
++        wb.save(buffer)
++        buffer.seek(0)
++        filename = f"session-{session.id}.xlsx"
++        return StreamingResponse(
++            buffer,
++            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
++            headers={"Content-Disposition": f"attachment; filename={filename}"},
++        )
++    raise HTTPException(status_code=400, detail="Unsupported format")
+diff --git a/backend/app/routers/ws_agent.py b/backend/app/routers/ws_agent.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..66f9688c45de675f0e3af6c6e3aeab548a457d68
+--- /dev/null
++++ b/backend/app/routers/ws_agent.py
+@@ -0,0 +1,61 @@
++from __future__ import annotations
++
++import json
++
++from fastapi import APIRouter, WebSocket, WebSocketDisconnect
++
++from ..services.agent import agent_orchestrator
++from ..services.outline import outline_builder
++from ..utils.ws_manager import WebSocketManager
++from .ws_tts import stream_text
++
++router = APIRouter()
++manager = WebSocketManager()
++
++
++@router.websocket("/ws/agent")
++async def websocket_agent(websocket: WebSocket) -> None:
++    session_id = websocket.query_params.get("session") or "0"
++    topic = websocket.query_params.get("topic") or "未命名采访"
++    await manager.connect(session_id, websocket)
++    outline = outline_builder.build(topic)
++    machine = await agent_orchestrator.ensure_session(session_id, topic, outline)
++    await manager.send_json(session_id, {"type": "outline", "payload": outline.model_dump()})
++    first_question = machine.next_question()
++    await manager.send_json(
++        session_id,
++        {
++            "type": "policy",
++            "action": "ask",
++            "question": first_question,
++            "stage": machine.data.stage.value,
++            "notes": [],
++        },
++    )
++    await stream_text(session_id, first_question)
++    try:
++        while True:
++            data = await websocket.receive_json()
++            event_type = data.get("type")
++            if event_type == "user_turn":
++                text = data.get("text", "")
++                if not text:
++                    continue
++                decision = await agent_orchestrator.handle_user_turn(session_id, text)
++                await manager.send_json(
++                    session_id,
++                    {
++                        "type": "policy",
++                        "action": decision.action,
++                        "question": decision.question,
++                        "stage": decision.stage.value,
++                        "notes": decision.notes,
++                    },
++                )
++                await stream_text(session_id, decision.question)
++            elif event_type == "barge_in":
++                await manager.send_json(session_id, {"type": "ack", "event": "barge_in"})
++            elif event_type == "control":
++                await manager.send_json(session_id, {"type": "ack", "event": data.get("command", "")})
++    except WebSocketDisconnect:
++        manager.disconnect(session_id)
+diff --git a/backend/app/routers/ws_asr.py b/backend/app/routers/ws_asr.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..05e19a2f7f84b4e3cfba19524bbb7c4fdf149e74
+--- /dev/null
++++ b/backend/app/routers/ws_asr.py
+@@ -0,0 +1,26 @@
++from __future__ import annotations
++
++from fastapi import APIRouter, WebSocket, WebSocketDisconnect
++
++from ..utils.ws_manager import WebSocketManager
++
++router = APIRouter()
++manager = WebSocketManager()
++
++
++@router.websocket("/ws/asr")
++async def websocket_asr(websocket: WebSocket) -> None:
++    session_id = websocket.query_params.get("session") or "default"
++    await manager.connect(session_id, websocket)
++    try:
++        while True:
++            message = await websocket.receive()
++            if "text" in message:
++                payload = message["text"].strip()
++                if not payload:
++                    continue
++                await manager.send_json(session_id, {"type": "asr_final", "text": payload})
++            elif "bytes" in message:
++                await manager.send_json(session_id, {"type": "asr_partial", "text": "[音频数据接收]"})
++    except WebSocketDisconnect:
++        manager.disconnect(session_id)
+diff --git a/backend/app/routers/ws_tts.py b/backend/app/routers/ws_tts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca3998acb4c0ddc3d8dddd34bb6d22ff1b6540ef
+--- /dev/null
++++ b/backend/app/routers/ws_tts.py
+@@ -0,0 +1,28 @@
++from __future__ import annotations
++
++from fastapi import APIRouter, WebSocket, WebSocketDisconnect
++
++from ..services import tts
++from ..utils.ws_manager import WebSocketManager
++
++router = APIRouter()
++manager = WebSocketManager()
++
++
++@router.websocket("/ws/tts")
++async def websocket_tts(websocket: WebSocket) -> None:
++    session_id = websocket.query_params.get("session") or "default"
++    await manager.connect(session_id, websocket)
++    try:
++        while True:
++            await websocket.receive_text()
++    except WebSocketDisconnect:
++        manager.disconnect(session_id)
++
++
++async def stream_text(session_id: str, text: str) -> None:
++    payload = tts.synthesize(text)
++    chunk_size = 4096
++    for start in range(0, len(payload), chunk_size):
++        await manager.send_bytes(session_id, payload[start:start + chunk_size])
++    await manager.send_json(session_id, {"type": "tts_end"})
+diff --git a/backend/app/schemas.py b/backend/app/schemas.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd653857b49ef0eb8d0ebf5d5d0247b9e648979c
+--- /dev/null
++++ b/backend/app/schemas.py
+@@ -0,0 +1,76 @@
++from __future__ import annotations
++
++from datetime import datetime
++from typing import List, Optional
++
++from pydantic import BaseModel, Field
++from pydantic.config import ConfigDict
++
++
++class NoteSchema(BaseModel):
++    model_config = ConfigDict(from_attributes=True)
++
++    id: int
++    category: str
++    content: str
++    confidence: float
++    requires_clarification: bool
++    created_at: datetime
++
++
++class TurnSchema(BaseModel):
++    model_config = ConfigDict(from_attributes=True)
++
++    id: int
++    speaker: str
++    transcript: str
++    stage: str
++    llm_action: str
++    created_at: datetime
++
++
++class SessionSchema(BaseModel):
++    model_config = ConfigDict(from_attributes=True)
++
++    id: int
++    topic: str
++    interviewer: Optional[str]
++    interviewee: Optional[str]
++    started_at: datetime
++    status: str
++
++
++class PlanQuestion(BaseModel):
++    question: str
++    emphasis: List[str] = Field(default_factory=list)
++
++
++class PlanSection(BaseModel):
++    stage: str
++    questions: List[PlanQuestion]
++
++
++class PlanResponse(BaseModel):
++    topic: str
++    sections: List[PlanSection]
++
++
++class SessionCreate(BaseModel):
++    topic: str
++    interviewer: Optional[str] = None
++    interviewee: Optional[str] = None
++
++
++class SessionCreateResponse(BaseModel):
++    session: SessionSchema
++    outline: PlanResponse
++
++
++class TranscriptAppendRequest(BaseModel):
++    speaker: str
++    text: str
++
++
++class ExportRequest(BaseModel):
++    session_id: int
++    format: str = Field(pattern="^(docx|xlsx)$")
+diff --git a/backend/app/services/agent.py b/backend/app/services/agent.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..229348c4be03cfd312dc193ed2dda1c6d2d8e0fa
+--- /dev/null
++++ b/backend/app/services/agent.py
+@@ -0,0 +1,85 @@
++from __future__ import annotations
++
++import asyncio
++from dataclasses import dataclass
++from typing import Dict
++
++from ..models import Note, Session, Turn
++from ..schemas import PlanResponse
++from ..database import SessionLocal
++from .extraction import extractor
++from .outline import outline_builder
++from .state_machine import InterviewStage, StateMachine
++
++
++@dataclass
++class AgentDecision:
++    action: str
++    question: str
++    stage: InterviewStage
++    notes: list[dict]
++
++
++class AgentOrchestrator:
++    """Coordinates interview turns and persistence."""
++
++    def __init__(self) -> None:
++        self._machines: Dict[str, StateMachine] = {}
++        self._lock = asyncio.Lock()
++
++    async def ensure_session(self, session_id: str, topic: str, outline: PlanResponse | None = None) -> StateMachine:
++        async with self._lock:
++            if session_id in self._machines:
++                return self._machines[session_id]
++            outline_obj = outline or outline_builder.build(topic)
++            questions = [q.question for section in outline_obj.sections for q in section.questions]
++            machine = StateMachine(session_id=session_id, topic=topic, outline_questions=questions)
++            self._machines[session_id] = machine
++            return machine
++
++    async def handle_user_turn(self, session_id: str, text: str, speaker: str = "user") -> AgentDecision:
++        machine = self._machines[session_id]
++        previous_stage = machine.data.stage
++        if previous_stage == InterviewStage.CLARIFY and machine.data.pending_clarifications:
++            machine.data.resolve_clarification(machine.data.pending_clarifications[0])
++        machine.transition_after_answer()
++        question = machine.next_question()
++        notes = extractor.extract(text)
++        for note in notes:
++            if note.requires_clarification:
++                machine.register_clarification(note.content)
++        decision = AgentDecision(
++            action="ask",
++            question=question,
++            stage=machine.data.stage,
++            notes=[note.__dict__ for note in notes],
++        )
++        await self._persist_turn(session_id=session_id, speaker=speaker, text=text, decision=decision)
++        return decision
++
++    async def _persist_turn(self, session_id: str, speaker: str, text: str, decision: AgentDecision) -> None:
++        async with SessionLocal() as db:  # open independent session outside FastAPI DI
++            session_obj = await db.get(Session, int(session_id))
++            if not session_obj:
++                return
++            turn = Turn(
++                session_id=session_obj.id,
++                speaker=speaker,
++                transcript=text,
++                stage=decision.stage.value,
++                llm_action=decision.action,
++            )
++            db.add(turn)
++            for payload in decision.notes:
++                note = Note(
++                    session_id=session_obj.id,
++                    category=payload["category"],
++                    content=payload["content"],
++                    confidence=payload["confidence"],
++                    requires_clarification=payload["requires_clarification"],
++                )
++                db.add(note)
++            await db.commit()
++
++
++agent_orchestrator = AgentOrchestrator()
+diff --git a/backend/app/services/extraction.py b/backend/app/services/extraction.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c4ec5eecb80766fdad28b34ea5ab9943a9367cb
+--- /dev/null
++++ b/backend/app/services/extraction.py
+@@ -0,0 +1,58 @@
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass
++from typing import Iterable, List
++
++from ..schemas import NoteSchema
++
++
++FUZZY_MARKERS = {"可能", "大概", "不确定", "暂时"}
++NUMBER_PATTERN = re.compile(r"(?P<value>\d+(?:\.\d+)?)(?P<unit>[%万亿万件人小时元人民币]*)")
++
++
++@dataclass
++class ExtractedNote:
++    category: str
++    content: str
++    confidence: float = 0.9
++    requires_clarification: bool = False
++
++
++class InformationExtractor:
++    """A lightweight rule-based extractor used for the MVP."""
++
++    def extract(self, utterance: str) -> List[ExtractedNote]:
++        notes: list[ExtractedNote] = []
++        numbers = NUMBER_PATTERN.findall(utterance)
++        for value, unit in numbers:
++            notes.append(
++                ExtractedNote(
++                    category="数字",
++                    content=f"{value}{unit}",
++                    confidence=0.95,
++                    requires_clarification=False,
++                )
++            )
++        if any(marker in utterance for marker in FUZZY_MARKERS):
++            notes.append(
++                ExtractedNote(
++                    category="澄清",
++                    content="回答含糊，需要追问",
++                    confidence=0.6,
++                    requires_clarification=True,
++                )
++            )
++        if not notes:
++            notes.append(
++                ExtractedNote(
++                    category="观点",
++                    content=utterance.strip(),
++                    confidence=0.75,
++                    requires_clarification=False,
++                )
++            )
++        return notes
++
++
++extractor = InformationExtractor()
+diff --git a/backend/app/services/outline.py b/backend/app/services/outline.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d00085b2c1868f0326db7a2e4aee5e0d282b5447
+--- /dev/null
++++ b/backend/app/services/outline.py
+@@ -0,0 +1,30 @@
++from __future__ import annotations
++
++from typing import Iterable
++
++from ..schemas import PlanQuestion, PlanResponse, PlanSection
++
++
++DEFAULT_STAGES = [
++    ("背景", ["请介绍一下当前的业务背景", "团队目前的规模与分工情况如何？"]),
++    ("细节", ["这个项目的核心指标有哪些？", "在实施过程中遇到了什么挑战？"]),
++    ("结论", ["下一步的关键计划是什么？", "还需要哪些外部支持？"]),
++]
++
++
++class OutlineBuilder:
++    """Generate structured three-level outlines."""
++
++    def build(self, topic: str, seeds: Iterable[tuple[str, list[str]]] | None = None) -> PlanResponse:
++        blueprint = list(seeds or DEFAULT_STAGES)
++        sections = [
++            PlanSection(
++                stage=stage,
++                questions=[PlanQuestion(question=q) for q in questions],
++            )
++            for stage, questions in blueprint
++        ]
++        return PlanResponse(topic=topic, sections=sections)
++
++
++outline_builder = OutlineBuilder()
+diff --git a/backend/app/services/state_machine.py b/backend/app/services/state_machine.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..33753450c95e0a7fd5849d2dde796377f63d2cbd
+--- /dev/null
++++ b/backend/app/services/state_machine.py
+@@ -0,0 +1,87 @@
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import List
++
++
++class InterviewStage(str, Enum):
++    OPENING = "Opening"
++    EXPLORATION = "Exploration"
++    DEEP_DIVE = "DeepDive"
++    CLARIFY = "Clarify"
++    CLOSING = "Closing"
++
++
++@dataclass
++class ConversationState:
++    session_id: str
++    topic: str
++    outline_questions: List[str]
++    answered_questions: List[str] = field(default_factory=list)
++    stage: InterviewStage = InterviewStage.OPENING
++    pending_clarifications: List[str] = field(default_factory=list)
++    last_question: str | None = None
++
++    def coverage(self) -> float:
++        if not self.outline_questions:
++            return 1.0
++        return len(self.answered_questions) / len(self.outline_questions)
++
++    def mark_answered(self, question: str) -> None:
++        if question not in self.answered_questions:
++            self.answered_questions.append(question)
++
++    def mark_last_answered(self) -> None:
++        if self.last_question:
++            self.mark_answered(self.last_question)
++            self.last_question = None
++
++    def add_clarification(self, content: str) -> None:
++        if content not in self.pending_clarifications:
++            self.pending_clarifications.append(content)
++
++    def resolve_clarification(self, content: str) -> None:
++        if content in self.pending_clarifications:
++            self.pending_clarifications.remove(content)
++
++
++class StateMachine:
++    def __init__(self, session_id: str, topic: str, outline_questions: List[str]):
++        self.data = ConversationState(session_id=session_id, topic=topic, outline_questions=outline_questions)
++
++    def transition_after_answer(self) -> None:
++        self.data.mark_last_answered()
++        coverage = self.data.coverage()
++        if coverage > 0.75 and not self.data.pending_clarifications:
++            self.data.stage = InterviewStage.CLOSING
++        elif self.data.pending_clarifications:
++            self.data.stage = InterviewStage.CLARIFY
++        elif coverage > 0.4:
++            self.data.stage = InterviewStage.DEEP_DIVE
++        else:
++            self.data.stage = InterviewStage.EXPLORATION
++
++    def next_question(self) -> str:
++        unanswered = [q for q in self.data.outline_questions if q not in self.data.answered_questions]
++        if self.data.stage == InterviewStage.CLARIFY and self.data.pending_clarifications:
++            question = f"关于『{self.data.pending_clarifications[0]}』能再具体说明一下吗？"
++            self.data.last_question = question
++            return question
++        if self.data.stage == InterviewStage.CLOSING:
++            question = "感谢分享，我们来做个小结：还有哪些重点没有提到？"
++            self.data.last_question = question
++            return question
++        if unanswered:
++            question = unanswered[0]
++            self.data.last_question = question
++            return question
++        question = "能否补充一个具体数据或案例，帮助我们理解？"
++        self.data.last_question = question
++        return question
++
++    def register_clarification(self, content: str) -> None:
++        self.data.add_clarification(content)
++
++
++__all__ = ["InterviewStage", "ConversationState", "StateMachine"]
+diff --git a/backend/app/services/tts.py b/backend/app/services/tts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3afc4697e106f447f743fc82bc12313d8471cad8
+--- /dev/null
++++ b/backend/app/services/tts.py
+@@ -0,0 +1,27 @@
++from __future__ import annotations
++
++import math
++import struct
++from typing import Iterable
++
++SAMPLE_RATE = 16000
++
++
++def _generate_wave(samples: Iterable[float]) -> bytes:
++    frames = bytearray()
++    for sample in samples:
++        clipped = max(-1.0, min(1.0, sample))
++        frames.extend(struct.pack('<h', int(clipped * 32767)))
++    return bytes(frames)
++
++
++def synthesize(text: str) -> bytes:
++    """Generate a simple sine wave payload to stand in for TTS audio."""
++    duration_seconds = max(1.0, min(3.0, len(text) / 12))
++    total_samples = int(SAMPLE_RATE * duration_seconds)
++    frequency = 440 + (len(text) % 5) * 110
++    samples = (
++        math.sin(2 * math.pi * frequency * (i / SAMPLE_RATE)) * 0.3
++        for i in range(total_samples)
++    )
++    return _generate_wave(samples)
+diff --git a/backend/app/utils/ws_manager.py b/backend/app/utils/ws_manager.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dac99756a409040a89b4dc51574795f0f127171f
+--- /dev/null
++++ b/backend/app/utils/ws_manager.py
+@@ -0,0 +1,27 @@
++from __future__ import annotations
++
++from typing import Dict
++
++from fastapi import WebSocket
++
++
++class WebSocketManager:
++    def __init__(self) -> None:
++        self._connections: Dict[str, WebSocket] = {}
++
++    async def connect(self, session_id: str, websocket: WebSocket) -> None:
++        await websocket.accept()
++        self._connections[session_id] = websocket
++
++    def disconnect(self, session_id: str) -> None:
++        self._connections.pop(session_id, None)
++
++    async def send_json(self, session_id: str, data: dict) -> None:
++        websocket = self._connections.get(session_id)
++        if websocket:
++            await websocket.send_json(data)
++
++    async def send_bytes(self, session_id: str, data: bytes) -> None:
++        websocket = self._connections.get(session_id)
++        if websocket:
++            await websocket.send_bytes(data)
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..36bfa524423ed2d90c95efefe3585a29e8a33310
+--- /dev/null
++++ b/backend/requirements.txt
+@@ -0,0 +1,8 @@
++fastapi==0.111.0
++uvicorn[standard]==0.29.0
++sqlalchemy[asyncio]==2.0.31
++aiosqlite==0.20.0
++pydantic==2.7.1
++pydantic-settings==2.3.2
++openpyxl==3.1.2
++python-docx==1.1.0
+diff --git a/docs/auto_interview_mvp.md b/docs/auto_interview_mvp.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..eec1983aba84471d9c22e715d4ad88e83cbdc700
+--- /dev/null
++++ b/docs/auto_interview_mvp.md
+@@ -0,0 +1,234 @@
++# 自动采访机器人 MVP 实施方案
++
++## 1. 目标概述
++
++面向“采访机器人训练系统控制台”打造一个自动采访模式 MVP，实现“语音提问 → 语音回答 → 文本记录 → 实时转写”的闭环，并满足行业采访场景对专业提纲、动态追问、话题引导、信息结构化记录等需求。方案兼顾前端采集播报、后端编排调度、算法策略与数据管理，便于后续扩展到半自动/手动模式。
++
++## 2. 关键技术栈与模型
++
++| 能力 | 技术/服务 | 说明 |
++| --- | --- | --- |
++| 前端 | React 18 + TypeScript, Zustand, WebRTC, MediaRecorder, AudioWorklet, @ricky0123/vad-web | 支持流式采集、VAD、barge-in、实时字幕与控制面板 |
++| 后端 | FastAPI + uvicorn + asyncio, aiohttp, tenacity, SQLAlchemy(Async), asyncpg, aioboto3, orjson | 实现 WS 通道、状态机、第三方 API 转发、数据持久化 |
++| LLM | 方舟 Ark `ep-*` 接入点（≥30B 参数，如 Qwen2.5-32B-Instruct/DeepSeek-V3） | 通过 OpenAI 兼容接口完成提纲生成、策略决策、信息抽取 |
++| ASR | 自有流式 ASR：`4o-mini-transcribe` 或 FunASR Paraformer/Whisper-v3-turbo | 需提供 2s 内延迟，返回 partial/final 结果 |
++| TTS | 豆包 OpenSpeech TTS（流式或单向接口） | 支持≥3种音色、24000Hz 采样，后端切片推送实现 barge-in |
++| 向量/RAG | `bge-m3` 或 `text-embedding-3-large` | 可选：行业资料检索、提纲覆盖率计算 |
++| 数据库 | PostgreSQL（元数据、提纲、转写、纪要） | 结构化记录与检索 |
++| 对象存储 | MinIO/S3 | 存储原始音频、导出文件 |
++
++## 3. 系统整体架构
++
++```
++前端(React UI)
++  ├─ WebRTC/VAD → /ws/asr → 后端 ASR 代理 → 第三方 ASR
++  ├─ TTS 播放器 ← /ws/tts ← 后端 TTS 代理 ← 豆包 OpenSpeech
++  └─ 控制/状态 ←→ /ws/agent ←→ 采访编排器(State Machine + Policy)
++                                     ├─ LLM (Ark Gateway)
++                                     ├─ 信息抽取器(JSON-Schema + 规则)
++                                     └─ 可选 RAG (PGVector/Elastic)
++                 数据持久化：Postgres + MinIO/S3 + 导出(Word/Excel)
++```
++
++核心分层：
++
++1. **前端层**：负责低时延采集、实时字幕、提纲/澄清列表可视化、模式切换与人工介入。
++2. **会话层**（后端 WS）：维护 ASR、Agent、TTS 三通道与事件总线，实现 barge-in、回声抑制、播报控制。
++3. **策略层**：基于状态机与 LLM 决策（提问、追问、话题回归、结束），同步更新提纲覆盖与澄清项。
++4. **知识层**：预置行业知识库/RAG，支撑专业术语识别、背景补充。
++5. **数据层**：结构化存储对话、提纲、关键信息，支持检索与导出。
++
++## 4. 数据流与协议
++
++### 4.1 WebSocket 通道
++
++* `/ws/asr`：浏览器以 `audio/webm;codecs=opus` 40ms 分片上行；后端转发至 ASR；下行 partial/final 字幕事件 `{type, text, ts, seq}`。
++* `/ws/agent`：
++  * 上行：`user_turn`（final 文本）、`barge_in`、`control`（pause/resume/stop）、`manual_question`。
++  * 下行：`policy`（ask/followup/regress/close）、`bot_reply_delta`、`note_update`、`coverage_update`、`status`。
++* `/ws/tts`：后端将豆包 TTS 音频切片推送 `audio_chunk` 二进制；结束包 `tts_end`；支持 `cancel` 指令应对 barge-in。
++
++### 4.2 HTTP API
++
++* `POST /v1/plan`：输入主题、被访者、可选背景资料；输出三级提纲。
++* `POST /v1/export/{docx|excel}`：生成采访纪要、Q&A、行动项。
++* `GET /v1/sessions`、`GET /v1/sessions/{id}`：检索历史采访、拉取结构化记录。
++* `POST /v1/sessions/{id}/notes`：落人工补充信息。
++
++### 4.3 事件总线
++
++`apps/backend/core/bus.py`：基于 `asyncio.Queue`（单实例）或 Redis Streams（分布式）实现会话内广播，供 ASR/TTS/Agent/前端共享状态。
++
++## 5. 前端实现要点
++
++1. **音频采集**：`navigator.mediaDevices.getUserMedia` + `MediaRecorder` 40ms 分片；启用 `echoCancellation`、`noiseSuppression`、`autoGainControl`；并行 `@ricky0123/vad-web` 做 VAD。
++2. **barge-in**：检测语音概率持续 > 阈值 200–300ms 时：
++   * 发送 `{type:"barge_in"}` 给 `/ws/agent`；
++   * 暂停 TTS 播放器、标记 `bargeIn` 状态；
++   * 等待 ASR final 后恢复。
++3. **字幕渲染**：partial 灰色、final 黑色；final 触发转写面板滚动、写入结构化数据。
++4. **提纲视图**：左侧展示三级提纲，节点显示覆盖率、状态色（未问/已问/需澄清）。
++5. **待澄清列表**：来自后端 `note_update` 中低置信度或缺失槽位，支持人工点击“标记完成”。
++6. **模式控制**：自动/半自动/手动；半自动允许人工挑选下一问；手动模式 UI 直接发送 `manual_question`。
++7. **TTS 播放器**：`MediaSource` 或 `AudioWorklet` 实现流式播放，支持取消/暂停；跟踪 TTS 文本窗口用于 echo mask。
++8. **错误与重连**：`reconnecting-websocket`；显式状态提示（ASR/TTS/LLM 正常、降级、重试）。
++
++## 6. 后端服务设计
++
++### 6.1 目录结构
++
++```
++apps/backend/
++  app.py
++  core/
++    config.py
++    bus.py
++    models.py
++    storage.py
++    llm.py
++    asr_client.py
++    tts_client.py
++  services/
++    agent_orchestrator.py
++    outline.py
++    extract_notes.py
++    exporters/
++      excel.py
++      docx.py
++  routes/
++    ws_asr.py
++    ws_agent.py
++    ws_tts.py
++    http_api.py
++```
++
++### 6.2 功能模块
++
++* **`asr_client.py`**：管理与流式 ASR 的半双工连接；封装写入/读取协程；支持重试、超时、回声文本遮挡。
++* **`tts_client.py`**：调用豆包 OpenSpeech，收取整段音频后切片推送；维护 TTS 文本缓存，支持取消。
++* **`llm.py`**：基于方舟 Ark OpenAI 兼容接口，提供 `chat_stream`、`completion_json` 等方法；支持 temperature/top_p 配置。
++* **`agent_orchestrator.py`**：
++  * 会话状态机（Opening → Exploration → DeepDive → Clarify → Closing）；
++  * 调用 `policy_decide`（LLM）产生行动；
++  * 触发 `tts_client.stream_and_broadcast` 播报问题；
++  * 同步信息抽取、提纲覆盖率更新。
++* **`extract_notes.py`**：LLM 生成 JSON（按 Schema），使用 `pydantic` 校验；数值/日期后处理；更新待澄清项。
++* **`outline.py`**：提纲生成、覆盖率计算；使用句向量余弦相似度≥0.6 视为覆盖。
++* **`storage.py`**：Postgres + SQLAlchemy（异步）；MinIO 通过 `aioboto3` 上传音频；提供检索接口。
++* **`exporters`**：Excel 使用 `XlsxWriter`；Word 使用 `python-docx` 模板。
++
++### 6.3 可靠性
++
++* `tenacity` 指数退避重试；LLM 超时 fallback（简短问题模板）。
++* 会话心跳（30s）+ 超时自动结束。
++* 关键事件（barge-in、API 错误）写入审计日志。
++
++## 7. 算法与策略
++
++### 7.1 提纲生成
++
++Prompt 示例：
++```
++请基于以下采访主题与背景资料，生成三级递进采访提纲，格式 JSON：
++[
++  {"stage":"背景", "questions":[...]},
++  {"stage":"细节", "questions":[...]},
++  {"stage":"结论", "questions":[...]}
++]
++每个问题不超过 18 字，覆盖关键维度：背景、细节、指标、风险、行动。
++```
++输出后做去重、长度截断、敏感词检测。
++
++### 7.2 状态机策略
++
++* **Opening**：寒暄、确认议程、提出首问。
++* **Exploration**：遍历提纲一级问题，记录覆盖情况。
++* **DeepDive**：针对含关键信息的回答追问“原因/方法/指标/计划”。
++* **Clarify**：清理 `pending_slots`（缺数字/日期/责任人）。
++* **Closing**：总结要点、确认行动项、约定后续。
++
++### 7.3 动态追问与话题回归
++
++* 模糊词表：可能、差不多、之后、暂时、再说、不一定等；出现则触发 `followup`。
++* 主题偏移检测：最近 3 轮问答与提纲主题的句向量相似度 < 0.65，则生成引导性问题；LLM Prompt 限制“回到主题 X”。
++* 结束条件：覆盖率 ≥80% 或连续 2 轮无新增事实。
++
++### 7.4 信息抽取
++
++Schema：
++```
++{
++  "people":[{"name":"string","role":"string?"}],
++  "time":"string?",
++  "facts":[{"claim":"string","evidence":"string?","confidence":0.0}],
++  "numbers":[{"name":"string","value":0,"unit":"string"}],
++  "actions":[{"who":"string","todo":"string","due":"string?"}],
++  "open_questions":["string"]
++}
++```
++
++低置信度(`confidence <0.6`) 自动加入待澄清；金额/百分比/中文数字转换通过规则处理。
++
++### 7.5 回声文本屏蔽
++
++维护最近 10–15 秒 TTS 文本窗口；ASR final 到来时计算与窗口句相似度（`rapidfuzz.partial_ratio` ≥90%）则视为回声，不进入策略器。
++
++## 8. 数据库与存储设计
++
++### 8.1 PostgreSQL 表
++
++* `sessions(id, subject, interviewer, interviewee, status, created_at, updated_at)`
++* `turns(id, session_id, speaker, text, start_ms, end_ms, action, confidence)`
++* `notes(id, session_id, payload_jsonb, version, created_at)`
++* `outline(id, session_id, structure_jsonb, coverage_jsonb)`
++* `pending_slots(id, session_id, slot_type, description, status)`
++* `exports(id, session_id, type, url, created_at)`
++
++### 8.2 对象存储
++
++* 音频录制（全程 + 回答切片）
++* 导出文件（Word/Excel）
++* 可选：截图、情绪分析帧等
++
++## 9. 部署与配置
++
++* Docker Compose：`frontend`、`backend`、`pg`、`redis`（可选）、`minio`、`nginx`、`llm-gateway`（方舟代理）、`asr-proxy`、`tts-proxy`。
++* `.env` 关键变量：
++  * `ASR_BASE_URL`、`ASR_API_KEY`
++  * `VOLC_TTS_BASE_URL`、`VOLC_TTS_API_KEY`、`VOLC_TTS_RESOURCE_ID`
++  * `ARK_BASE_URL`、`ARK_API_KEY`、`ARK_MODEL_ID`
++  * `PG_URL`、`S3_ENDPOINT`、`S3_ACCESS_KEY`、`S3_SECRET_KEY`
++* 日志：`structlog` + ELK/ClickHouse 可选；音频加密存储（MinIO Server-Side Encryption）；HTTPS 终端加密。
++
++## 10. 实施里程碑
++
++1. **第 1 周：基础骨架**
++   * 前端：WS 客户端、音频采集、字幕面板雏形。
++   * 后端：FastAPI WS、ASR/TTS 代理打通（空回调）。
++2. **第 2 周：策略与提纲**
++   * 对接方舟 LLM，完成提纲生成 API、策略器基础问答循环。
++   * 初版状态机（Opening/Exploration/Closing）。
++3. **第 3 周：追问与纪要**
++   * 动态追问、话题回归、信息抽取、待澄清列表。
++   * PostgreSQL/MinIO 存储，转写与纪要导出。
++4. **第 4 周：优化与验收**
++   * barge-in、回声掩码、TTS 中断控制。
++   * 指标自测（ASR 延迟、提纲覆盖率、追问成功率）。
++   * 安全与部署文档。
++
++## 11. 验收指标映射
++
++| 需求 | 对应方案 |
++| --- | --- |
++| 多模态闭环 | WebRTC + ASR/TTS WS + Agent 状态机 |
++| 专业采访逻辑 | 三级提纲、状态机 + LLM 策略、追问/回归规则 |
++| 领域适配 | 指定知识库/RAG，术语词表，行业模板 |
++| 实时记录 | 信息抽取器 + Postgres Notes + 待澄清列表 |
++| 数据导出 | Excel/Word 导出模块 |
++| 硬件接口 | 前端支持 HDMI 输出、TTS/麦克风参数；后端无硬件锁定 |
++| 安全存储 | 数据库加密、MinIO 存储、API Key 管理 |
++| API 扩展 | RESTful + WebSocket，留有 webhook/SDK 入口 |
++
++---
++
++该方案确保 MVP 在 4 周内可交付，并为后续功能（情感分析、视觉融合、半自动控制台等）预留扩展空间。
+diff --git a/frontend/index.html b/frontend/index.html
+new file mode 100644
+index 0000000000000000000000000000000000000000..2860575b7bd5faf0cebb0cb020c59ffa90bf89a0
+--- /dev/null
++++ b/frontend/index.html
+@@ -0,0 +1,12 @@
++<!DOCTYPE html>
++<html lang="zh-CN">
++  <head>
++    <meta charset="UTF-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    <title>采访机器人控制台</title>
++  </head>
++  <body>
++    <div id="root"></div>
++    <script type="module" src="/src/main.tsx"></script>
++  </body>
++</html>
+diff --git a/frontend/package.json b/frontend/package.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ee5294ae8a25707cd8861f12117daef014ebf1f
+--- /dev/null
++++ b/frontend/package.json
+@@ -0,0 +1,26 @@
++{
++  "name": "interviewer-agent-frontend",
++  "version": "0.1.0",
++  "private": true,
++  "scripts": {
++    "dev": "vite",
++    "build": "tsc && vite build",
++    "preview": "vite preview"
++  },
++  "dependencies": {
++    "clsx": "^2.1.0",
++    "zustand": "^4.5.2",
++    "reconnecting-websocket": "^4.4.0",
++    "react": "^18.2.0",
++    "react-dom": "^18.2.0"
++  },
++  "devDependencies": {
++    "@types/react": "^18.2.45",
++    "@types/react-dom": "^18.2.18",
++    "@typescript-eslint/eslint-plugin": "^7.0.0",
++    "@typescript-eslint/parser": "^7.0.0",
++    "@vitejs/plugin-react": "^4.2.1",
++    "typescript": "^5.4.5",
++    "vite": "^5.2.0"
++  }
++}
+diff --git a/frontend/src/App.css b/frontend/src/App.css
+new file mode 100644
+index 0000000000000000000000000000000000000000..00ec76667e99e5f8b913caf3aa3183746eef527b
+--- /dev/null
++++ b/frontend/src/App.css
+@@ -0,0 +1,157 @@
++:root {
++  color-scheme: light dark;
++  font-family: 'Segoe UI', 'PingFang SC', 'Helvetica Neue', Arial, sans-serif;
++}
++
++body {
++  margin: 0;
++  background: #f5f7fb;
++  color: #1f2933;
++}
++
++.layout {
++  min-height: 100vh;
++  display: flex;
++  flex-direction: column;
++}
++
++header {
++  padding: 1.2rem 2rem;
++  background: #1d4ed8;
++  color: #ffffff;
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++}
++
++main {
++  flex: 1;
++  display: grid;
++  grid-template-columns: 340px 1fr;
++  gap: 1.2rem;
++  padding: 1.2rem 2rem;
++  box-sizing: border-box;
++}
++
++.panel {
++  background: #ffffff;
++  border-radius: 12px;
++  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
++  padding: 1rem 1.2rem;
++  display: flex;
++  flex-direction: column;
++  gap: 0.6rem;
++}
++
++.panel h2 {
++  margin: 0;
++  font-size: 1.1rem;
++}
++
++.outline-list {
++  display: flex;
++  flex-direction: column;
++  gap: 0.8rem;
++}
++
++.outline-section h3 {
++  margin: 0 0 0.4rem;
++  font-size: 1rem;
++  color: #2563eb;
++}
++
++.outline-section ol {
++  margin: 0;
++  padding-left: 1.2rem;
++  display: flex;
++  flex-direction: column;
++  gap: 0.4rem;
++}
++
++.transcript {
++  overflow-y: auto;
++}
++
++.transcript ul {
++  list-style: none;
++  margin: 0;
++  padding: 0;
++  display: flex;
++  flex-direction: column;
++  gap: 0.8rem;
++}
++
++.transcript li {
++  display: flex;
++  gap: 0.8rem;
++  align-items: baseline;
++}
++
++.transcript li.agent .speaker {
++  color: #1d4ed8;
++  font-weight: 600;
++}
++
++.transcript li.user .speaker {
++  color: #059669;
++  font-weight: 600;
++}
++
++.transcript .text {
++  flex: 1;
++}
++
++.next-question {
++  margin-top: 1.2rem;
++  background: #1d4ed8;
++  color: #fff;
++  border-radius: 12px;
++  padding: 1rem;
++  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
++}
++
++.next-question h2 {
++  margin: 0 0 0.6rem;
++}
++
++.control-bar {
++  padding: 1rem 2rem;
++  display: flex;
++  gap: 0.8rem;
++  background: #ffffff;
++  border-top: 1px solid rgba(148, 163, 184, 0.3);
++}
++
++.control-bar input {
++  flex: 1;
++  padding: 0.8rem 1rem;
++  border-radius: 999px;
++  border: 1px solid rgba(148, 163, 184, 0.6);
++  font-size: 1rem;
++}
++
++.control-bar button {
++  padding: 0.8rem 1.6rem;
++  border: none;
++  border-radius: 999px;
++  background: #1d4ed8;
++  color: #fff;
++  cursor: pointer;
++  font-weight: 600;
++}
++
++.coverage {
++  font-size: 0.95rem;
++  color: #475569;
++}
++
++.empty {
++  color: #94a3b8;
++}
++
++.stage {
++  font-size: 0.95rem;
++  background: rgba(255, 255, 255, 0.18);
++  padding: 0.3rem 0.8rem;
++  border-radius: 999px;
++}
+diff --git a/frontend/src/App.tsx b/frontend/src/App.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..384f162a8e866fcd39e30cba78da8b421684a41f
+--- /dev/null
++++ b/frontend/src/App.tsx
+@@ -0,0 +1,40 @@
++import './App.css';
++import { OutlinePanel } from './components/OutlinePanel';
++import { PendingClarify } from './components/PendingClarify';
++import { TranscriptPane } from './components/TranscriptPane';
++import { ControlBar } from './components/ControlBar';
++import { useBootstrapSession } from './hooks/useBootstrapSession';
++import { useSessionStore } from './store/useSessionStore';
++
++const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
++
++export function App() {
++  const stage = useSessionStore((state) => state.stage);
++  const pendingQuestion = useSessionStore((state) => state.pendingQuestion);
++  useBootstrapSession(API_BASE_URL);
++
++  return (
++    <div className="layout">
++      <header>
++        <h1>采访机器人控制台</h1>
++        <span className="stage">当前阶段：{stage}</span>
++      </header>
++      <main>
++        <section className="left-column">
++          <OutlinePanel />
++          <PendingClarify />
++        </section>
++        <section className="right-column">
++          <TranscriptPane />
++          <div className="next-question">
++            <h2>下一轮提问</h2>
++            <p>{pendingQuestion || '等待受访者回应...'}</p>
++          </div>
++        </section>
++      </main>
++      <ControlBar apiBaseUrl={API_BASE_URL} />
++    </div>
++  );
++}
++
++export default App;
+diff --git a/frontend/src/api/agentClient.ts b/frontend/src/api/agentClient.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4b1e1ee99039b85839eb610727e0caba8201b23c
+--- /dev/null
++++ b/frontend/src/api/agentClient.ts
+@@ -0,0 +1,47 @@
++import ReconnectingWebSocket from 'reconnecting-websocket';
++import { useSessionStore } from '../store/useSessionStore';
++
++const WS_OPTIONS = { maxReconnectionDelay: 4000, minReconnectionDelay: 250, reconnectionDelayGrowFactor: 1.5 };
++
++export class AgentClient {
++  private socket: ReconnectingWebSocket | null = null;
++
++  constructor(private readonly baseUrl: string, private readonly sessionId: string, private readonly topic: string) {}
++
++  connect() {
++    const wsUrl = `${this.baseUrl.replace('http', 'ws')}/ws/agent?session=${this.sessionId}&topic=${encodeURIComponent(this.topic)}`;
++    this.socket = new ReconnectingWebSocket(wsUrl, [], WS_OPTIONS);
++    this.socket.addEventListener('message', (event) => {
++      const data = JSON.parse(event.data);
++      const store = useSessionStore.getState();
++      if (data.type === 'outline') {
++        const outlineSections = data.payload.sections.map((section: any) => ({
++          stage: section.stage,
++          questions: section.questions.map((q: any) => q.question)
++        }));
++        store.setOutline(outlineSections);
++      }
++      if (data.type === 'policy') {
++        store.addTranscript({ speaker: 'agent', text: data.question });
++        store.setPendingQuestion(data.question);
++        store.setStage(data.stage);
++        store.updateNotes(
++          data.notes.map((item: any) => ({
++            category: item.category,
++            content: item.content,
++            requiresClarification: item.requires_clarification
++          }))
++        );
++      }
++    });
++  }
++
++  sendUserTurn(text: string) {
++    if (!this.socket) return;
++    this.socket.send(JSON.stringify({ type: 'user_turn', text }));
++  }
++
++  close() {
++    this.socket?.close();
++  }
++}
+diff --git a/frontend/src/api/asrClient.ts b/frontend/src/api/asrClient.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e543f003bcd120187311c4d2a973599f554c329
+--- /dev/null
++++ b/frontend/src/api/asrClient.ts
+@@ -0,0 +1,29 @@
++import ReconnectingWebSocket from 'reconnecting-websocket';
++import { useSessionStore } from '../store/useSessionStore';
++
++const WS_OPTIONS = { maxReconnectionDelay: 4000, minReconnectionDelay: 250, reconnectionDelayGrowFactor: 1.5 };
++
++export class AsrClient {
++  private socket: ReconnectingWebSocket | null = null;
++
++  constructor(private readonly baseUrl: string, private readonly sessionId: string) {}
++
++  connect() {
++    const wsUrl = `${this.baseUrl.replace('http', 'ws')}/ws/asr?session=${this.sessionId}`;
++    this.socket = new ReconnectingWebSocket(wsUrl, [], WS_OPTIONS);
++    this.socket.addEventListener('message', (event) => {
++      const data = JSON.parse(event.data);
++      if (data.type === 'asr_final') {
++        useSessionStore.getState().addTranscript({ speaker: 'user', text: data.text });
++      }
++    });
++  }
++
++  sendText(text: string) {
++    this.socket?.send(text);
++  }
++
++  close() {
++    this.socket?.close();
++  }
++}
+diff --git a/frontend/src/api/ttsClient.ts b/frontend/src/api/ttsClient.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..33f94d09f8b0dc9718ffab3a8145fb73fa0ee67c
+--- /dev/null
++++ b/frontend/src/api/ttsClient.ts
+@@ -0,0 +1,59 @@
++import ReconnectingWebSocket from 'reconnecting-websocket';
++
++const WS_OPTIONS = { maxReconnectionDelay: 4000, minReconnectionDelay: 250, reconnectionDelayGrowFactor: 1.5 };
++
++export class TtsClient {
++  private socket: ReconnectingWebSocket | null = null;
++  private audioContext: AudioContext;
++  private bufferQueue: Float32Array[] = [];
++  private playing = false;
++
++  constructor(private readonly baseUrl: string, private readonly sessionId: string) {
++    this.audioContext = new AudioContext({ sampleRate: 16000 });
++  }
++
++  connect() {
++    const wsUrl = `${this.baseUrl.replace('http', 'ws')}/ws/tts?session=${this.sessionId}`;
++    this.socket = new ReconnectingWebSocket(wsUrl, [], WS_OPTIONS);
++    this.socket.addEventListener('message', async (event) => {
++      if (typeof event.data === 'string') {
++        const payload = JSON.parse(event.data);
++        if (payload.type === 'tts_end') {
++          return;
++        }
++      } else {
++        const arrayBuffer = await event.data.arrayBuffer();
++        const pcmView = new DataView(arrayBuffer);
++        const floatData = new Float32Array(pcmView.byteLength / 2);
++        for (let i = 0; i < floatData.length; i++) {
++          floatData[i] = pcmView.getInt16(i * 2, true) / 32767;
++        }
++        this.bufferQueue.push(floatData);
++        if (!this.playing) {
++          this.playing = true;
++          this.flush();
++        }
++      }
++    });
++  }
++
++  private async flush() {
++    while (this.bufferQueue.length > 0) {
++      const chunk = this.bufferQueue.shift();
++      if (!chunk) continue;
++      const audioBuffer = this.audioContext.createBuffer(1, chunk.length, 16000);
++      audioBuffer.getChannelData(0).set(chunk);
++      const source = this.audioContext.createBufferSource();
++      source.buffer = audioBuffer;
++      source.connect(this.audioContext.destination);
++      source.start();
++      await new Promise((resolve) => (source.onended = resolve));
++    }
++    this.playing = false;
++  }
++
++  close() {
++    this.socket?.close();
++    this.audioContext.close();
++  }
++}
+diff --git a/frontend/src/components/ControlBar.tsx b/frontend/src/components/ControlBar.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a4aaf6f0d2bf7672d57e9f83e2c75d9cd5d038b
+--- /dev/null
++++ b/frontend/src/components/ControlBar.tsx
+@@ -0,0 +1,29 @@
++import { FormEvent, useState } from 'react';
++import { useInterviewClients } from '../hooks/useInterviewClients';
++
++interface ControlBarProps {
++  apiBaseUrl: string;
++}
++
++export function ControlBar({ apiBaseUrl }: ControlBarProps) {
++  const [input, setInput] = useState('');
++  const { sendUserUtterance } = useInterviewClients(apiBaseUrl);
++
++  const handleSubmit = (event: FormEvent) => {
++    event.preventDefault();
++    if (!input.trim()) return;
++    sendUserUtterance(input.trim());
++    setInput('');
++  };
++
++  return (
++    <form className="control-bar" onSubmit={handleSubmit}>
++      <input
++        value={input}
++        onChange={(event) => setInput(event.target.value)}
++        placeholder="输入或粘贴转写文本，按 Enter 发送"
++      />
++      <button type="submit">发送</button>
++    </form>
++  );
++}
+diff --git a/frontend/src/components/OutlinePanel.tsx b/frontend/src/components/OutlinePanel.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3d335e3e94116d99052c67aa748d7973ff93053
+--- /dev/null
++++ b/frontend/src/components/OutlinePanel.tsx
+@@ -0,0 +1,33 @@
++import { useMemo } from 'react';
++import { useSessionStore } from '../store/useSessionStore';
++
++export function OutlinePanel() {
++  const outline = useSessionStore((state) => state.outline);
++  const transcript = useSessionStore((state) => state.transcript);
++
++  const totalQuestions = useMemo(
++    () => outline.reduce((acc, section) => acc + section.questions.length, 0),
++    [outline]
++  );
++  const answeredCount = useMemo(() => transcript.filter((item) => item.speaker === 'agent').length, [transcript]);
++  const coverage = totalQuestions ? Math.min(100, Math.round((answeredCount / totalQuestions) * 100)) : 0;
++
++  return (
++    <div className="panel">
++      <h2>采访提纲</h2>
++      <p className="coverage">覆盖进度：{coverage}%</p>
++      <div className="outline-list">
++        {outline.map((section) => (
++          <div key={section.stage} className="outline-section">
++            <h3>{section.stage}</h3>
++            <ol>
++              {section.questions.map((question) => (
++                <li key={question}>{question}</li>
++              ))}
++            </ol>
++          </div>
++        ))}
++      </div>
++    </div>
++  );
++}
+diff --git a/frontend/src/components/PendingClarify.tsx b/frontend/src/components/PendingClarify.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..49a8547877a272bf545b07d1c547e2af90b6aa6d
+--- /dev/null
++++ b/frontend/src/components/PendingClarify.tsx
+@@ -0,0 +1,18 @@
++import { useSessionStore } from '../store/useSessionStore';
++
++export function PendingClarify() {
++  const notes = useSessionStore((state) => state.notes);
++  const pending = notes.filter((note) => note.requiresClarification);
++
++  return (
++    <div className="panel">
++      <h2>待澄清</h2>
++      {pending.length === 0 ? <p className="empty">暂无待处理条目</p> : null}
++      <ul>
++        {pending.map((note, index) => (
++          <li key={`${note.content}-${index}`}>{note.content}</li>
++        ))}
++      </ul>
++    </div>
++  );
++}
+diff --git a/frontend/src/components/TranscriptPane.tsx b/frontend/src/components/TranscriptPane.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4accbb07cc196f135c1cbcc76dd310cb303e1efb
+--- /dev/null
++++ b/frontend/src/components/TranscriptPane.tsx
+@@ -0,0 +1,27 @@
++import { useEffect, useRef } from 'react';
++import { useSessionStore } from '../store/useSessionStore';
++
++export function TranscriptPane() {
++  const transcript = useSessionStore((state) => state.transcript);
++  const scrollRef = useRef<HTMLDivElement | null>(null);
++
++  useEffect(() => {
++    if (scrollRef.current) {
++      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
++    }
++  }, [transcript]);
++
++  return (
++    <div className="panel transcript" ref={scrollRef}>
++      <h2>实时记录</h2>
++      <ul>
++        {transcript.map((entry, index) => (
++          <li key={`${entry.speaker}-${index}`} className={entry.speaker}>
++            <span className="speaker">{entry.speaker === 'agent' ? '采访官' : '受访者'}</span>
++            <span className="text">{entry.text}</span>
++          </li>
++        ))}
++      </ul>
++    </div>
++  );
++}
+diff --git a/frontend/src/hooks/useBootstrapSession.ts b/frontend/src/hooks/useBootstrapSession.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..108ec5d729d3eddbfcf81de9723f63d5918537ca
+--- /dev/null
++++ b/frontend/src/hooks/useBootstrapSession.ts
+@@ -0,0 +1,30 @@
++import { useEffect } from 'react';
++import { useSessionStore } from '../store/useSessionStore';
++
++export function useBootstrapSession(apiBaseUrl: string) {
++  const setSession = useSessionStore((state) => state.setSession);
++  const setOutline = useSessionStore((state) => state.setOutline);
++
++  useEffect(() => {
++    async function bootstrap() {
++      try {
++        const response = await fetch(`${apiBaseUrl}/v1/sessions`, {
++          method: 'POST',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ topic: '科技企业采访', interviewer: 'AI采访官' })
++        });
++        const data = await response.json();
++        setSession({ sessionId: String(data.session.id), topic: data.session.topic });
++        setOutline(
++          data.outline.sections.map((section: any) => ({
++            stage: section.stage,
++            questions: section.questions.map((q: any) => q.question)
++          }))
++        );
++      } catch (error) {
++        console.error('Failed to bootstrap session', error);
++      }
++    }
++    bootstrap();
++  }, [apiBaseUrl, setOutline, setSession]);
++}
+diff --git a/frontend/src/hooks/useInterviewClients.ts b/frontend/src/hooks/useInterviewClients.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2356b06c46a8bdcdfda3fa5f5ec40819017e5238
+--- /dev/null
++++ b/frontend/src/hooks/useInterviewClients.ts
+@@ -0,0 +1,39 @@
++import { useEffect, useRef } from 'react';
++import { AgentClient } from '../api/agentClient';
++import { AsrClient } from '../api/asrClient';
++import { TtsClient } from '../api/ttsClient';
++import { useSessionStore } from '../store/useSessionStore';
++
++export function useInterviewClients(apiBaseUrl: string) {
++  const session = useSessionStore((state) => ({ sessionId: state.sessionId, topic: state.topic }));
++  const agentRef = useRef<AgentClient | null>(null);
++  const asrRef = useRef<AsrClient | null>(null);
++  const ttsRef = useRef<TtsClient | null>(null);
++
++  useEffect(() => {
++    if (session.sessionId === '0') {
++      return;
++    }
++    agentRef.current = new AgentClient(apiBaseUrl, session.sessionId, session.topic);
++    asrRef.current = new AsrClient(apiBaseUrl, session.sessionId);
++    ttsRef.current = new TtsClient(apiBaseUrl, session.sessionId);
++    agentRef.current.connect();
++    asrRef.current.connect();
++    ttsRef.current.connect();
++    return () => {
++      agentRef.current?.close();
++      asrRef.current?.close();
++      ttsRef.current?.close();
++    };
++  }, [apiBaseUrl, session.sessionId, session.topic]);
++
++  return {
++    sendUserUtterance(text: string) {
++      if (session.sessionId === '0') {
++        return;
++      }
++      agentRef.current?.sendUserTurn(text);
++      asrRef.current?.sendText(text);
++    }
++  };
++}
+diff --git a/frontend/src/main.tsx b/frontend/src/main.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..abd10b842c1ec624506504fa2edfaf136c39c746
+--- /dev/null
++++ b/frontend/src/main.tsx
+@@ -0,0 +1,9 @@
++import React from 'react';
++import ReactDOM from 'react-dom/client';
++import App from './App';
++
++ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
++  <React.StrictMode>
++    <App />
++  </React.StrictMode>
++);
+diff --git a/frontend/src/store/useSessionStore.ts b/frontend/src/store/useSessionStore.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..eafeb7f37748af9d2e23c5b547ebb0a1ca6552ae
+--- /dev/null
++++ b/frontend/src/store/useSessionStore.ts
+@@ -0,0 +1,54 @@
++import { create } from 'zustand';
++
++type TranscriptEntry = {
++  speaker: 'agent' | 'user';
++  text: string;
++};
++
++type OutlineSection = {
++  stage: string;
++  questions: string[];
++};
++
++type SessionState = {
++  sessionId: string;
++  topic: string;
++  outline: OutlineSection[];
++  transcript: TranscriptEntry[];
++  pendingQuestion: string;
++  stage: string;
++  notes: { category: string; content: string; requiresClarification: boolean }[];
++  setSession: (payload: { sessionId: string; topic: string }) => void;
++  setOutline: (sections: OutlineSection[]) => void;
++  addTranscript: (entry: TranscriptEntry) => void;
++  setPendingQuestion: (question: string) => void;
++  setStage: (stage: string) => void;
++  updateNotes: (notes: SessionState['notes']) => void;
++  reset: () => void;
++};
++
++export const useSessionStore = create<SessionState>((set) => ({
++  sessionId: '0',
++  topic: '自动采访演示',
++  outline: [],
++  transcript: [],
++  pendingQuestion: '',
++  stage: 'Opening',
++  notes: [],
++  setSession: ({ sessionId, topic }) => set(() => ({ sessionId, topic })),
++  setOutline: (sections) => set(() => ({ outline: sections })),
++  addTranscript: (entry) => set((state) => ({ transcript: [...state.transcript, entry] })),
++  setPendingQuestion: (question) => set(() => ({ pendingQuestion: question })),
++  setStage: (stage) => set(() => ({ stage })),
++  updateNotes: (notes) => set(() => ({ notes })),
++  reset: () =>
++    set(() => ({
++      sessionId: '0',
++      topic: '自动采访演示',
++      outline: [],
++      transcript: [],
++      pendingQuestion: '',
++      stage: 'Opening',
++      notes: []
++    }))
++}));
+diff --git a/frontend/tsconfig.json b/frontend/tsconfig.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..68ea2c58d80e58b6562d8d752a1709f57d4ff9ab
+--- /dev/null
++++ b/frontend/tsconfig.json
+@@ -0,0 +1,21 @@
++{
++  "compilerOptions": {
++    "target": "ES2020",
++    "useDefineForClassFields": true,
++    "lib": ["DOM", "DOM.Iterable", "ES2020"],
++    "allowJs": false,
++    "skipLibCheck": true,
++    "esModuleInterop": true,
++    "allowSyntheticDefaultImports": true,
++    "strict": true,
++    "forceConsistentCasingInFileNames": true,
++    "module": "ESNext",
++    "moduleResolution": "Node",
++    "resolveJsonModule": true,
++    "isolatedModules": true,
++    "noEmit": true,
++    "jsx": "react-jsx"
++  },
++  "include": ["src"],
++  "references": [{ "path": "./tsconfig.node.json" }]
++}
+diff --git a/frontend/tsconfig.node.json b/frontend/tsconfig.node.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d31e2aed93c876bc048cf2f863cb2a847c901e8
+--- /dev/null
++++ b/frontend/tsconfig.node.json
+@@ -0,0 +1,9 @@
++{
++  "compilerOptions": {
++    "composite": true,
++    "module": "ESNext",
++    "moduleResolution": "Node",
++    "allowSyntheticDefaultImports": true
++  },
++  "include": ["vite.config.ts"]
++}
+diff --git a/frontend/vite.config.ts b/frontend/vite.config.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d9739a586d126ed8bf174eda0050449841fc2450
+--- /dev/null
++++ b/frontend/vite.config.ts
+@@ -0,0 +1,10 @@
++import { defineConfig } from 'vite';
++import react from '@vitejs/plugin-react';
++
++export default defineConfig({
++  plugins: [react()],
++  server: {
++    port: 5173,
++    host: '0.0.0.0'
++  }
++});

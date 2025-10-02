@@ -1,0 +1,157 @@
+:root {
+  color-scheme: light dark;
+  font-family: 'Segoe UI', 'PingFang SC', 'Helvetica Neue', Arial, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #f5f7fb;
+  color: #1f2933;
+}
+
+.layout {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+header {
+  padding: 1.2rem 2rem;
+  background: #1d4ed8;
+  color: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+main {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 340px 1fr;
+  gap: 1.2rem;
+  padding: 1.2rem 2rem;
+  box-sizing: border-box;
+}
+
+.panel {
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 6px 20px rgba(15, 23, 42, 0.08);
+  padding: 1rem 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.panel h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.outline-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.outline-section h3 {
+  margin: 0 0 0.4rem;
+  font-size: 1rem;
+  color: #2563eb;
+}
+
+.outline-section ol {
+  margin: 0;
+  padding-left: 1.2rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.transcript {
+  overflow-y: auto;
+}
+
+.transcript ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.transcript li {
+  display: flex;
+  gap: 0.8rem;
+  align-items: baseline;
+}
+
+.transcript li.agent .speaker {
+  color: #1d4ed8;
+  font-weight: 600;
+}
+
+.transcript li.user .speaker {
+  color: #059669;
+  font-weight: 600;
+}
+
+.transcript .text {
+  flex: 1;
+}
+
+.next-question {
+  margin-top: 1.2rem;
+  background: #1d4ed8;
+  color: #fff;
+  border-radius: 12px;
+  padding: 1rem;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
+}
+
+.next-question h2 {
+  margin: 0 0 0.6rem;
+}
+
+.control-bar {
+  padding: 1rem 2rem;
+  display: flex;
+  gap: 0.8rem;
+  background: #ffffff;
+  border-top: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.control-bar input {
+  flex: 1;
+  padding: 0.8rem 1rem;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.6);
+  font-size: 1rem;
+}
+
+.control-bar button {
+  padding: 0.8rem 1.6rem;
+  border: none;
+  border-radius: 999px;
+  background: #1d4ed8;
+  color: #fff;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.coverage {
+  font-size: 0.95rem;
+  color: #475569;
+}
+
+.empty {
+  color: #94a3b8;
+}
+
+.stage {
+  font-size: 0.95rem;
+  background: rgba(255, 255, 255, 0.18);
+  padding: 0.3rem 0.8rem;
+  border-radius: 999px;
+}
