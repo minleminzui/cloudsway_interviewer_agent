@@ -22,7 +22,7 @@ async def create_session(payload: SessionCreate, db: AsyncSession = Depends(get_
     db.add(session)
     await db.commit()
     await db.refresh(session)
-    outline = outline_builder.build(payload.topic)
+    outline = await outline_builder.build(payload.topic)
     return SessionCreateResponse(session=session, outline=outline)
 
 
@@ -42,7 +42,7 @@ async def get_session_detail(session_id: int, db: AsyncSession = Depends(get_ses
 
 @router.post("/plan", response_model=PlanResponse)
 async def generate_plan(payload: SessionCreate) -> PlanResponse:
-    return outline_builder.build(payload.topic)
+    return await outline_builder.build(payload.topic)
 
 
 @router.post("/export")

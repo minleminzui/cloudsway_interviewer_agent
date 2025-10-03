@@ -26,6 +26,7 @@ class TurnSchema(BaseModel):
     transcript: str
     stage: str
     llm_action: str
+    llm_rationale: Optional[str] = None
     created_at: datetime
 
 

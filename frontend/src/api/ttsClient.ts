@@ -1,59 +1,73 @@
-import ReconnectingWebSocket from 'reconnecting-websocket';
+import { TtsPlayer } from '../audio/TtsPlayer';
+import { useSessionStore } from '../store/useSessionStore';
 
-const WS_OPTIONS = { maxReconnectionDelay: 4000, minReconnectionDelay: 250, reconnectionDelayGrowFactor: 1.5 };
+function makeWsUrl(baseUrl: string, path: string) {
+  const url = new URL(path, baseUrl);
+  url.protocol = url.protocol.replace('http', 'ws');
+  return url.toString();
+}
 
 export class TtsClient {
-  private socket: ReconnectingWebSocket | null = null;
-  private audioContext: AudioContext;
-  private bufferQueue: Float32Array[] = [];
-  private playing = false;
+  private ws: WebSocket | null = null;
+  private player = new TtsPlayer();
+  private ready = false;
 
-  constructor(private readonly baseUrl: string, private readonly sessionId: string) {
-    this.audioContext = new AudioContext({ sampleRate: 16000 });
-  }
+  constructor(private readonly baseUrl: string, private readonly sessionId: string) {}
 
   connect() {
-    const wsUrl = `${this.baseUrl.replace('http', 'ws')}/ws/tts?session=${this.sessionId}`;
-    this.socket = new ReconnectingWebSocket(wsUrl, [], WS_OPTIONS);
-    this.socket.addEventListener('message', async (event) => {
+    this.player.prepare();
+    const wsUrl = makeWsUrl(this.baseUrl, `/ws/tts?session=${this.sessionId}`);
+    this.ws = new WebSocket(wsUrl);
+    this.ws.binaryType = 'arraybuffer';
+    const setTtsReady = useSessionStore.getState().setTtsReady;
+
+    this.ws.onopen = () => {
+      this.ready = false;
+      setTtsReady(false);
+    };
+
+    this.ws.onmessage = (event) => {
       if (typeof event.data === 'string') {
-        const payload = JSON.parse(event.data);
-        if (payload.type === 'tts_end') {
-          return;
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.type === 'tts_ready') {
+            this.ready = true;
+            setTtsReady(true);
+            return;
+          }
+          if (payload.type === 'tts_end') {
+            this.player.finalize();
+            this.player.prepare();
+            return;
+          }
+        } catch (error) {
+          console.warn('[tts] failed to parse control message', error);
         }
-      } else {
-        const arrayBuffer = await event.data.arrayBuffer();
-        const pcmView = new DataView(arrayBuffer);
-        const floatData = new Float32Array(pcmView.byteLength / 2);
-        for (let i = 0; i < floatData.length; i++) {
-          floatData[i] = pcmView.getInt16(i * 2, true) / 32767;
-        }
-        this.bufferQueue.push(floatData);
-        if (!this.playing) {
-          this.playing = true;
-          this.flush();
-        }
+        return;
       }
-    });
+      if (!this.ready) {
+        // Drop audio chunks until the connection is acknowledged.
+        return;
+      }
+      const chunk = event.data as ArrayBuffer;
+      this.player.enqueue(chunk);
+    };
+
+    this.ws.onclose = () => {
+      this.ready = false;
+      setTtsReady(false);
+    };
   }
 
-  private async flush() {
-    while (this.bufferQueue.length > 0) {
-      const chunk = this.bufferQueue.shift();
-      if (!chunk) continue;
-      const audioBuffer = this.audioContext.createBuffer(1, chunk.length, 16000);
-      audioBuffer.getChannelData(0).set(chunk);
-      const source = this.audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-      source.connect(this.audioContext.destination);
-      source.start();
-      await new Promise((resolve) => (source.onended = resolve));
-    }
-    this.playing = false;
+  cancelPlayback() {
+    this.player.cancel();
+    this.player.prepare();
   }
 
   close() {
-    this.socket?.close();
-    this.audioContext.close();
+    this.cancelPlayback();
+    this.ws?.close();
+    this.ws = null;
+    this.player.destroy();
   }
 }

@@ -155,3 +155,19 @@ main {
   padding: 0.3rem 0.8rem;
   border-radius: 999px;
 }
+
+.tts-status {
+  margin-left: 1rem;
+  font-size: 0.9rem;
+  padding: 0.3rem 0.8rem;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.tts-status.ready {
+  background: rgba(34, 197, 94, 0.3);
+}
+
+.tts-status.waiting {
+  background: rgba(248, 113, 113, 0.35);
+}

@@ -1,0 +1,13 @@
+llm:
+  provider: volc_ark
+  base_url: ${ARK_BASE_URL}
+  model: ${ARK_MODEL_ID}
+  temperature: 0.4
+
+tts:
+  provider: volc_openspeech
+  base_url: ${VOLC_TTS_BASE_URL}
+  voice: ${VOLC_TTS_SPEAKER}
+  sample_rate: ${VOLC_TTS_SAMPLE_RATE}
+  format: ${VOLC_TTS_FORMAT}
+  stream: true

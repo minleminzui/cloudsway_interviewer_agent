@@ -10,6 +10,13 @@ type OutlineSection = {
   questions: string[];
 };
 
+type NoteEntry = {
+  category: string;
+  content: string;
+  requiresClarification: boolean;
+  confidence?: number;
+};
+
 type SessionState = {
   sessionId: string;
   topic: string;
@@ -17,13 +24,15 @@ type SessionState = {
   transcript: TranscriptEntry[];
   pendingQuestion: string;
   stage: string;
-  notes: { category: string; content: string; requiresClarification: boolean }[];
+  notes: NoteEntry[];
+  ttsReady: boolean;
   setSession: (payload: { sessionId: string; topic: string }) => void;
   setOutline: (sections: OutlineSection[]) => void;
   addTranscript: (entry: TranscriptEntry) => void;
   setPendingQuestion: (question: string) => void;
   setStage: (stage: string) => void;
-  updateNotes: (notes: SessionState['notes']) => void;
+  updateNotes: (notes: NoteEntry[]) => void;
+  setTtsReady: (ready: boolean) => void;
   reset: () => void;
 };
 
@@ -35,12 +44,27 @@ export const useSessionStore = create<SessionState>((set) => ({
   pendingQuestion: '',
   stage: 'Opening',
   notes: [],
+  ttsReady: false,
   setSession: ({ sessionId, topic }) => set(() => ({ sessionId, topic })),
   setOutline: (sections) => set(() => ({ outline: sections })),
   addTranscript: (entry) => set((state) => ({ transcript: [...state.transcript, entry] })),
   setPendingQuestion: (question) => set(() => ({ pendingQuestion: question })),
   setStage: (stage) => set(() => ({ stage })),
-  updateNotes: (notes) => set(() => ({ notes })),
+  updateNotes: (incoming) =>
+    set((state) => {
+      const map = new Map(state.notes.map((note) => [note.content, note]));
+      for (const note of incoming) {
+        const existing = map.get(note.content);
+        if (existing) {
+          existing.requiresClarification = existing.requiresClarification || note.requiresClarification;
+          existing.confidence = Math.max(existing.confidence ?? 0, note.confidence ?? 0);
+        } else {
+          map.set(note.content, { ...note });
+        }
+      }
+      return { notes: Array.from(map.values()) };
+    }),
+  setTtsReady: (ready) => set(() => ({ ttsReady: ready })),
   reset: () =>
     set(() => ({
       sessionId: '0',
@@ -49,6 +73,7 @@ export const useSessionStore = create<SessionState>((set) => ({
       transcript: [],
       pendingQuestion: '',
       stage: 'Opening',
-      notes: []
+      notes: [],
+      ttsReady: false
     }))
 }));

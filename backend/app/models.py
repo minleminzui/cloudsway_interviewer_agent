@@ -35,6 +35,7 @@ class Turn(Base):
     transcript: Mapped[str] = mapped_column(Text)
     stage: Mapped[str] = mapped_column(String(32))
     llm_action: Mapped[str] = mapped_column(String(32))
+    llm_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     session: Mapped[Session] = relationship(back_populates="turns")

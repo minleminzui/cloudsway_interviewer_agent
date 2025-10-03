@@ -29,7 +29,8 @@ export class AgentClient {
           data.notes.map((item: any) => ({
             category: item.category,
             content: item.content,
-            requiresClarification: item.requires_clarification
+            requiresClarification: item.requires_clarification,
+            confidence: item.confidence
           }))
         );
       }
