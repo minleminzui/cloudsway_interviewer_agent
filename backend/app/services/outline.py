@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Iterable
+from typing import Iterable, Any
 
 from ..config import settings
 from ..core import llm
@@ -62,16 +62,21 @@ class OutlineBuilder:
                     buffer.append(chunk)
                 raw = "".join(buffer).strip()
                 if raw:
-                    payload = json.loads(raw)
-                    blueprint = []
-                    for section in payload:
-                        stage = section.get("stage")
-                        questions = section.get("questions") or []
-                        if not stage or not isinstance(questions, list):
-                            continue
-                        normalized = [str(question).strip() for question in questions if str(question).strip()]
-                        if normalized:
-                            blueprint.append((str(stage), normalized))
+                    payload = _coerce_outline_payload(raw)
+                    if payload:
+                        blueprint = []
+                        for section in payload:
+                            stage = section.get("stage")
+                            questions = section.get("questions") or []
+                            if not stage or not isinstance(questions, list):
+                                continue
+                            normalized = [
+                                str(question).strip()
+                                for question in questions
+                                if str(question).strip()
+                            ]
+                            if normalized:
+                                blueprint.append((str(stage), normalized))
             except (llm.LLMNotConfiguredError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 LOGGER.warning("Ark outline generation failed, falling back to defaults: %s", exc)
                 blueprint = None
@@ -89,3 +94,58 @@ class OutlineBuilder:
 
 
 outline_builder = OutlineBuilder()
+
+def _coerce_outline_payload(raw: str) -> list[dict[str, Any]] | None:
+    """Attempt to extract a list of section payloads from ``raw`` text."""
+
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+
+    cleaned = _strip_code_fence(cleaned)
+
+    def _normalize(value: Any) -> list[dict[str, Any]] | None:
+        if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+            return value
+        if isinstance(value, dict):
+            for key in ("outline", "data", "result"):
+                candidate = value.get(key)
+                if isinstance(candidate, list) and all(isinstance(item, dict) for item in candidate):
+                    return candidate
+        return None
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        parsed = None
+    if parsed is not None:
+        normalized = _normalize(parsed)
+        if normalized is not None:
+            return normalized
+
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(cleaned):
+        try:
+            value, next_idx = decoder.raw_decode(cleaned, idx)
+        except json.JSONDecodeError:
+            idx += 1
+            continue
+        idx = max(next_idx, idx + 1)
+        normalized = _normalize(value)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _strip_code_fence(payload: str) -> str:
+    if not payload.startswith("```"):
+        return payload
+    lines = payload.splitlines()
+    if len(lines) < 2:
+        return payload
+    if lines[-1].strip().startswith("```"):
+        content = lines[1:-1]
+    else:
+        content = lines[1:]
+    return "\n".join(content).strip()

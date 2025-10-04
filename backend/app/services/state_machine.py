@@ -93,15 +93,16 @@ class StateMachine:
         from .policy import PolicyDecision
         unanswered = [q for q in self.data.outline_questions if q not in self.data.answered_questions]
         rationale = "rule-based fallback"
-        if self.data.stage == InterviewStage.CLARIFY and self.data.pending_clarifications:
-            question = f"关于『{self.data.pending_clarifications[0]}』能再具体说明一下吗？"
-            return PolicyDecision(action="clarify", question=question, rationale=rationale)question
+        if self.data.pending_clarifications:
+            target = self.data.pending_clarifications[0]
+            question = f"关于『{target}』能再具体说明一下吗？"
+            return PolicyDecision(action="clarify", question=question, rationale=rationale)
         if self.data.stage == InterviewStage.CLOSING:
             question = "感谢分享，我们来做个小结：还有哪些重点没有提到？"
             return PolicyDecision(action="close", question=question, rationale=rationale)
         if unanswered:
             question = unanswered[0]
-            return PolicyDecision(action="ask", question=question, rationale=rationale)question
+            return PolicyDecision(action="ask", question=question, rationale=rationale)
         question = "能否补充一个具体数据或案例，帮助我们理解？"
         return PolicyDecision(action="ask", question=question, rationale=rationale)
 

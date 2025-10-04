@@ -1,1077 +1,303 @@
-diff --git a/README.md b/README.md
-index 96d9f4a53ec16a18df2f842f897139d1d6815b1e..55e2c61944bea19f5533e5d0a39ae6f1accab884 100644
---- a/README.md
-+++ b/README.md
-@@ -23,50 +23,61 @@ This repository contains a runnable minimum viable product of the multi模态采
- │   │   ├── routers/             # http_api、ws_asr、ws_agent、ws_tts
- │   │   └── services/            # outline、state_machine、agent、tts 等逻辑
- │   └── requirements.txt         # 后端依赖
- ├── frontend/
- │   ├── src/
- │   │   ├── components/          # React UI 组件
- │   │   ├── store/               # Zustand 会话状态
- │   │   ├── api/                 # WebSocket 客户端封装
- │   │   ├── hooks/               # 会话初始化、连接管理
- │   │   └── App.tsx              # 控制台布局
- │   ├── package.json             # 前端依赖与脚本
- │   └── vite.config.ts           # Vite 配置
- ├── docs/auto_interview_mvp.md   # 原始产品实施细化方案
- ├── .env.example                 # 后端环境变量示例
- └── README.md
- ```
- 
- ## 快速开始
- 
- ### 准备环境
- 
- - Python 3.11+
- - Node.js 20+
- - 推荐在项目根目录复制 `.env.example` 为 `.env` 并按需修改。
- 
-+若需启用 Ark LLM 生成提纲与策略，请在 `.env` 中增加以下配置：
-+
-+```
-+ARK_BASE_URL=https://ark.example.com
-+ARK_API_KEY=sk-***
-+ARK_MODEL_ID=ep-xxxx
-+# 可选：分别为提纲与策略指定模型
-+ARK_OUTLINE_MODEL_ID=ep-outline
-+ARK_POLICY_MODEL_ID=ep-policy
-+```
-+
- ### 启动后端
- 
- ```bash
- cd backend
- python -m venv .venv
- source .venv/bin/activate
- pip install -r requirements.txt
- uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
- ```
- 
- 启动后可访问：
- 
- - REST: `http://localhost:8000/v1/sessions`
- - WebSocket: `ws://localhost:8000/ws/{agent|asr|tts}`
- 
- ### 启动前端
- 
- ```bash
- cd frontend
- npm install
- npm run dev -- --host 0.0.0.0 --port 5173
- ```
- 
- 浏览器访问 `http://localhost:5173`，系统将自动创建采访会话、拉取提纲并开始播报第一轮问题。可在底部输入框填写回答，观察右侧字幕与下一问动态更新。
- 
-diff --git a/backend/app/config.py b/backend/app/config.py
-index 621bac8a7ef1dd30a1632b69bd4779eaea783259..df065eb001fcb3e3c131e6f360c086e0ee89b801 100644
---- a/backend/app/config.py
-+++ b/backend/app/config.py
-@@ -1,35 +1,44 @@
- from __future__ import annotations
- 
- from functools import lru_cache
- from typing import List
- 
- from pydantic import Field
- from pydantic_settings import BaseSettings, SettingsConfigDict
- 
- 
- class Settings(BaseSettings):
-     """Application runtime configuration."""
- 
-     app_name: str = Field(default="interviewer-agent-backend", alias="APP_NAME")
-     environment: str = Field(default="development", alias="ENVIRONMENT")
-     database_url: str = Field(default="sqlite+aiosqlite:///./interviewer.db", alias="DATABASE_URL")
-     allow_origins_raw: str | None = Field(default=None, alias="ALLOW_ORIGINS")
-     asr_upstream_url: str | None = Field(default=None, alias="ASR_UPSTREAM_URL")
-     tts_upstream_url: str | None = Field(default=None, alias="TTS_UPSTREAM_URL")
-     llm_upstream_url: str | None = Field(default=None, alias="LLM_UPSTREAM_URL")
-+    ark_base_url: str | None = Field(default=None, alias="ARK_BASE_URL")
-+    ark_api_key: str | None = Field(default=None, alias="ARK_API_KEY")
-+    ark_model_id: str | None = Field(default=None, alias="ARK_MODEL_ID")
-+    ark_outline_model_id: str | None = Field(default=None, alias="ARK_OUTLINE_MODEL_ID")
-+    ark_policy_model_id: str | None = Field(default=None, alias="ARK_POLICY_MODEL_ID")
- 
-     model_config = SettingsConfigDict(env_file=".env", extra="ignore", case_sensitive=False)
- 
-     @property
-     def allow_origins(self) -> List[str]:
-         if not self.allow_origins_raw:
-             return ["http://localhost:5173", "http://127.0.0.1:5173"]
-         return [origin.strip() for origin in self.allow_origins_raw.split(",") if origin.strip()]
- 
-+    @property
-+    def llm_credentials_ready(self) -> bool:
-+        return bool(self.ark_base_url and self.ark_api_key and self.ark_model_id)
-+
- 
- @lru_cache
- def get_settings() -> Settings:
-     return Settings()
- 
- 
- settings = get_settings()
-diff --git a/backend/app/core/__init__.py b/backend/app/core/__init__.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..41686223e5b1bdb7e4ca50f2afb1966447c2af9d
---- /dev/null
-+++ b/backend/app/core/__init__.py
-@@ -0,0 +1 @@
-+"""Core utilities for external service integrations."""
-diff --git a/backend/app/core/llm.py b/backend/app/core/llm.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..06f50030281c55241618b01627c26c15a3f97d24
---- /dev/null
-+++ b/backend/app/core/llm.py
-@@ -0,0 +1,100 @@
-+from __future__ import annotations
-+import json
-+import logging
-+from collections.abc import AsyncIterator, Iterable
-+from typing import Any, Dict, Optional
-+
-+try:  # pragma: no cover - optional dependency for tests
-+    import aiohttp
-+except ImportError:  # pragma: no cover
-+    aiohttp = None  # type: ignore[assignment]
-+
-+from ..config import settings
-+
-+LOGGER = logging.getLogger(__name__)
-+
-+
-+class LLMNotConfiguredError(RuntimeError):
-+    """Raised when Ark credentials are not available."""
-+
-+
-+async def chat_stream(
-+    messages: Iterable[Dict[str, Any]],
-+    *,
-+    model: str | None = None,
-+    temperature: float | None = None,
-+    top_p: float | None = None,
-+    extra_headers: Optional[Dict[str, str]] = None,
-+) -> AsyncIterator[str]:
-+    """Stream chat completion chunks from the Ark OpenAI-compatible endpoint.
-+
-+    Parameters
-+    ----------
-+    messages:
-+        The conversation messages to send to the Ark endpoint.
-+    model:
-+        Optional override for the model identifier.
-+    temperature:
-+        Optional sampling temperature.
-+    top_p:
-+        Optional nucleus sampling probability.
-+    extra_headers:
-+        Extra HTTP headers to merge into the request.
-+
-+    Yields
-+    ------
-+    str
-+        Raw content deltas as they are streamed from the upstream service.
-+    """
-+
-+    if aiohttp is None:
-+        raise RuntimeError("aiohttp is required for chat_stream")
-+    if not settings.llm_credentials_ready:
-+        raise LLMNotConfiguredError("Ark credentials are not configured")
-+
-+    payload: Dict[str, Any] = {
-+        "model": model or settings.ark_model_id,
-+        "messages": list(messages),
-+        "stream": True,
-+    }
-+    if temperature is not None:
-+        payload["temperature"] = temperature
-+    if top_p is not None:
-+        payload["top_p"] = top_p
-+
-+    headers = {
-+        "Authorization": f"Bearer {settings.ark_api_key}",
-+        "Content-Type": "application/json",
-+    }
-+    if extra_headers:
-+        headers.update(extra_headers)
-+
-+    url = f"{settings.ark_base_url.rstrip('/')}/v1/chat/completions"
-+    timeout = aiohttp.ClientTimeout(total=60)
-+
-+    async with aiohttp.ClientSession(timeout=timeout) as session:
-+        async with session.post(url, headers=headers, json=payload) as response:
-+            response.raise_for_status()
-+            async for line in response.content:
-+                if not line:
-+                    continue
-+                for chunk in line.decode("utf-8").splitlines():
-+                    if not chunk or not chunk.startswith("data:"):
-+                        continue
-+                    data = chunk.removeprefix("data:").strip()
-+                    if data == "[DONE]":
-+                        return
-+                    try:
-+                        parsed = json.loads(data)
-+                    except json.JSONDecodeError:
-+                        LOGGER.debug("Skipping non-JSON stream fragment: %s", data)
-+                        continue
-+                    choices = parsed.get("choices") or []
-+                    for choice in choices:
-+                        delta = choice.get("delta", {})
-+                        content = delta.get("content")
-+                        if content:
-+                            yield content
-+
-+
-+__all__ = ["chat_stream", "LLMNotConfiguredError"]
-diff --git a/backend/app/models.py b/backend/app/models.py
-index f2774c0890de6315a47b39c4acec51a9019aa980..63d98295473c5755097883789a31d5a36af2bdb0 100644
---- a/backend/app/models.py
-+++ b/backend/app/models.py
-@@ -13,42 +13,43 @@ class Base(DeclarativeBase):
- 
- class Session(Base):
-     __tablename__ = "sessions"
- 
-     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-     topic: Mapped[str] = mapped_column(String(255))
-     interviewer: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-     interviewee: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-     status: Mapped[str] = mapped_column(String(32), default="active")
-     metadata_json: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
- 
-     turns: Mapped[list["Turn"]] = relationship(back_populates="session", cascade="all, delete-orphan")
-     notes: Mapped[list["Note"]] = relationship(back_populates="session", cascade="all, delete-orphan")
- 
- 
- class Turn(Base):
-     __tablename__ = "turns"
- 
-     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-     session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
-     speaker: Mapped[str] = mapped_column(String(32))
-     transcript: Mapped[str] = mapped_column(Text)
-     stage: Mapped[str] = mapped_column(String(32))
-     llm_action: Mapped[str] = mapped_column(String(32))
-+    llm_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
-     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
- 
-     session: Mapped[Session] = relationship(back_populates="turns")
- 
- 
- class Note(Base):
-     __tablename__ = "notes"
- 
-     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-     session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
-     category: Mapped[str] = mapped_column(String(64))
-     content: Mapped[str] = mapped_column(Text)
-     confidence: Mapped[float] = mapped_column(default=1.0)
-     requires_clarification: Mapped[bool] = mapped_column(default=False)
-     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
- 
-     session: Mapped[Session] = relationship(back_populates="notes")
-diff --git a/backend/app/routers/http_api.py b/backend/app/routers/http_api.py
-index a945b0d89ca49e9b6c78ac8c69834bc40c482a1f..04bce06f98bd389dff8a8a609639ab980b731eb5 100644
---- a/backend/app/routers/http_api.py
-+++ b/backend/app/routers/http_api.py
-@@ -1,70 +1,70 @@
- from __future__ import annotations
- 
- import io
- from typing import List
- 
- from fastapi import APIRouter, Depends, HTTPException
- from fastapi.responses import StreamingResponse
- from sqlalchemy import select
- from sqlalchemy.ext.asyncio import AsyncSession
- 
- from ..database import get_session
- from ..models import Note, Session, Turn
- from ..schemas import ExportRequest, PlanResponse, SessionCreate, SessionCreateResponse, SessionSchema
- from ..services.outline import outline_builder
- 
- router = APIRouter()
- 
- 
- @router.post("/sessions", response_model=SessionCreateResponse)
- async def create_session(payload: SessionCreate, db: AsyncSession = Depends(get_session)) -> SessionCreateResponse:
-     session = Session(topic=payload.topic, interviewer=payload.interviewer, interviewee=payload.interviewee)
-     db.add(session)
-     await db.commit()
-     await db.refresh(session)
--    outline = outline_builder.build(payload.topic)
-+    outline = await outline_builder.build(payload.topic)
-     return SessionCreateResponse(session=session, outline=outline)
- 
- 
- @router.get("/sessions", response_model=List[SessionSchema])
- async def list_sessions(db: AsyncSession = Depends(get_session)) -> List[SessionSchema]:
-     result = await db.execute(select(Session))
-     return list(result.scalars())
- 
- 
- @router.get("/sessions/{session_id}", response_model=SessionSchema)
- async def get_session_detail(session_id: int, db: AsyncSession = Depends(get_session)) -> SessionSchema:
-     session = await db.get(Session, session_id)
-     if not session:
-         raise HTTPException(status_code=404, detail="Session not found")
-     return session
- 
- 
- @router.post("/plan", response_model=PlanResponse)
- async def generate_plan(payload: SessionCreate) -> PlanResponse:
--    return outline_builder.build(payload.topic)
-+    return await outline_builder.build(payload.topic)
- 
- 
- @router.post("/export")
- async def export_summary(payload: ExportRequest, db: AsyncSession = Depends(get_session)) -> StreamingResponse:
-     session = await db.get(Session, payload.session_id)
-     if not session:
-         raise HTTPException(status_code=404, detail="Session not found")
-     turns = await db.execute(select(Turn).where(Turn.session_id == payload.session_id))
-     notes = await db.execute(select(Note).where(Note.session_id == payload.session_id))
-     turn_rows = list(turns.scalars())
-     note_rows = list(notes.scalars())
-     if payload.format == "docx":
-         from docx import Document
- 
-         document = Document()
-         document.add_heading(f"采访纪要 - {session.topic}", level=1)
-         for turn in turn_rows:
-             document.add_heading(f"{turn.speaker} ({turn.stage})", level=2)
-             document.add_paragraph(turn.transcript)
-         document.add_heading("要点", level=2)
-         for note in note_rows:
-             document.add_paragraph(f"[{note.category}] {note.content}")
-         buffer = io.BytesIO()
-         document.save(buffer)
-         buffer.seek(0)
-diff --git a/backend/app/routers/ws_agent.py b/backend/app/routers/ws_agent.py
-index 66f9688c45de675f0e3af6c6e3aeab548a457d68..83a1d9af15595ea3a080a5b7ebe6515244f4b238 100644
---- a/backend/app/routers/ws_agent.py
-+++ b/backend/app/routers/ws_agent.py
-@@ -1,61 +1,63 @@
- from __future__ import annotations
- 
- import json
- 
- from fastapi import APIRouter, WebSocket, WebSocketDisconnect
- 
- from ..services.agent import agent_orchestrator
- from ..services.outline import outline_builder
- from ..utils.ws_manager import WebSocketManager
- from .ws_tts import stream_text
- 
- router = APIRouter()
- manager = WebSocketManager()
- 
- 
- @router.websocket("/ws/agent")
- async def websocket_agent(websocket: WebSocket) -> None:
-     session_id = websocket.query_params.get("session") or "0"
-     topic = websocket.query_params.get("topic") or "未命名采访"
-     await manager.connect(session_id, websocket)
--    outline = outline_builder.build(topic)
-+    outline = await outline_builder.build(topic)
-     machine = await agent_orchestrator.ensure_session(session_id, topic, outline)
-     await manager.send_json(session_id, {"type": "outline", "payload": outline.model_dump()})
--    first_question = machine.next_question()
-+    first_decision = await agent_orchestrator.bootstrap_decision(session_id)
-     await manager.send_json(
-         session_id,
-         {
-             "type": "policy",
--            "action": "ask",
--            "question": first_question,
-+            "action": first_decision.action,
-+            "question": first_decision.question,
-             "stage": machine.data.stage.value,
-             "notes": [],
-+            "rationale": first_decision.rationale,
-         },
-     )
--    await stream_text(session_id, first_question)
-+    await stream_text(session_id, first_decision.question)
-     try:
-         while True:
-             data = await websocket.receive_json()
-             event_type = data.get("type")
-             if event_type == "user_turn":
-                 text = data.get("text", "")
-                 if not text:
-                     continue
-                 decision = await agent_orchestrator.handle_user_turn(session_id, text)
-                 await manager.send_json(
-                     session_id,
-                     {
-                         "type": "policy",
-                         "action": decision.action,
-                         "question": decision.question,
-                         "stage": decision.stage.value,
-                         "notes": decision.notes,
-+                        "rationale": decision.rationale,
-                     },
-                 )
-                 await stream_text(session_id, decision.question)
-             elif event_type == "barge_in":
-                 await manager.send_json(session_id, {"type": "ack", "event": "barge_in"})
-             elif event_type == "control":
-                 await manager.send_json(session_id, {"type": "ack", "event": data.get("command", "")})
-     except WebSocketDisconnect:
-         manager.disconnect(session_id)
-diff --git a/backend/app/schemas.py b/backend/app/schemas.py
-index dd653857b49ef0eb8d0ebf5d5d0247b9e648979c..10eff7da375346a43b05f0b41808b1132f4417fc 100644
---- a/backend/app/schemas.py
-+++ b/backend/app/schemas.py
-@@ -4,50 +4,51 @@ from datetime import datetime
- from typing import List, Optional
- 
- from pydantic import BaseModel, Field
- from pydantic.config import ConfigDict
- 
- 
- class NoteSchema(BaseModel):
-     model_config = ConfigDict(from_attributes=True)
- 
-     id: int
-     category: str
-     content: str
-     confidence: float
-     requires_clarification: bool
-     created_at: datetime
- 
- 
- class TurnSchema(BaseModel):
-     model_config = ConfigDict(from_attributes=True)
- 
-     id: int
-     speaker: str
-     transcript: str
-     stage: str
-     llm_action: str
-+    llm_rationale: Optional[str] = None
-     created_at: datetime
- 
- 
- class SessionSchema(BaseModel):
-     model_config = ConfigDict(from_attributes=True)
- 
-     id: int
-     topic: str
-     interviewer: Optional[str]
-     interviewee: Optional[str]
-     started_at: datetime
-     status: str
- 
- 
- class PlanQuestion(BaseModel):
-     question: str
-     emphasis: List[str] = Field(default_factory=list)
- 
- 
- class PlanSection(BaseModel):
-     stage: str
-     questions: List[PlanQuestion]
- 
- 
- class PlanResponse(BaseModel):
-diff --git a/backend/app/services/agent.py b/backend/app/services/agent.py
-index 229348c4be03cfd312dc193ed2dda1c6d2d8e0fa..024c734377f38fc6a18ec2500ec8ea91ca8da41c 100644
---- a/backend/app/services/agent.py
-+++ b/backend/app/services/agent.py
-@@ -1,85 +1,117 @@
- from __future__ import annotations
- 
- import asyncio
- from dataclasses import dataclass
- from typing import Dict
- 
- from ..models import Note, Session, Turn
- from ..schemas import PlanResponse
- from ..database import SessionLocal
- from .extraction import extractor
- from .outline import outline_builder
-+from .policy import PolicyDecision, PolicyError, decide_policy
- from .state_machine import InterviewStage, StateMachine
+diff --git a/backend/app/core/ws_tts_manager.py b/backend/app/core/ws_tts_manager.py
+index 018c6bac22b1a529d11bd752548f9e2044037182..8e082e7a093c4e368808a3aeb836aedb683e249f 100644
+--- a/backend/app/core/ws_tts_manager.py
++++ b/backend/app/core/ws_tts_manager.py
+@@ -13,50 +13,51 @@ LOGGER = logging.getLogger(__name__)
  
  
  @dataclass
- class AgentDecision:
-     action: str
-     question: str
-     stage: InterviewStage
-     notes: list[dict]
-+    rationale: str
+ class CancellationToken:
+     _event: asyncio.Event = field(init=False, repr=False)
+ 
+     def __post_init__(self) -> None:
+         self._event = asyncio.Event()
+ 
+     def cancel(self) -> None:
+         self._event.set()
+ 
+     def is_cancelled(self) -> bool:
+         return self._event.is_set()
  
  
- class AgentOrchestrator:
-     """Coordinates interview turns and persistence."""
+ class WsTtsManager:
+     """Manage TTS websocket peers per session and allow stream cancellation."""
  
      def __init__(self) -> None:
-         self._machines: Dict[str, StateMachine] = {}
+         self._peers: Dict[str, Set[WebSocket]] = {}
          self._lock = asyncio.Lock()
+         self._ready_events: Dict[str, asyncio.Event] = {}
+         self._curr_task: Dict[str, asyncio.Task] = {}
+         self._cancel_token: Dict[str, CancellationToken] = {}
++        self._pending_json: Dict[str, list[dict]] = {}
  
-     async def ensure_session(self, session_id: str, topic: str, outline: PlanResponse | None = None) -> StateMachine:
+     async def register(self, sid: str, ws: WebSocket) -> None:
+         LOGGER.info("Registering TTS peer handshake sid=%s", sid)
+         await ws.accept()
+         LOGGER.debug("Accepted TTS websocket sid=%s", sid)
+         readiness_reset = False
          async with self._lock:
-             if session_id in self._machines:
-                 return self._machines[session_id]
--            outline_obj = outline or outline_builder.build(topic)
-+            outline_obj = outline or await outline_builder.build(topic)
-             questions = [q.question for section in outline_obj.sections for q in section.questions]
-             machine = StateMachine(session_id=session_id, topic=topic, outline_questions=questions)
-             self._machines[session_id] = machine
-             return machine
- 
-+    async def bootstrap_decision(self, session_id: str) -> AgentDecision:
-+        machine = self._machines[session_id]
-+        policy_decision = await self._decide_with_fallback(machine)
-+        self._sync_stage_with_action(machine, policy_decision.action)
-+        machine.apply_policy_decision(policy_decision)
-+        return AgentDecision(
-+            action=policy_decision.action,
-+            question=policy_decision.question,
-+            stage=machine.data.stage,
-+            notes=[],
-+            rationale=policy_decision.rationale,
-+        )
-+
-     async def handle_user_turn(self, session_id: str, text: str, speaker: str = "user") -> AgentDecision:
-         machine = self._machines[session_id]
-+        machine.record_user_turn(text)
-         previous_stage = machine.data.stage
-         if previous_stage == InterviewStage.CLARIFY and machine.data.pending_clarifications:
-             machine.data.resolve_clarification(machine.data.pending_clarifications[0])
-         machine.transition_after_answer()
--        question = machine.next_question()
-         notes = extractor.extract(text)
-         for note in notes:
-             if note.requires_clarification:
-                 machine.register_clarification(note.content)
-+        policy_decision = await self._decide_with_fallback(machine)
-+        self._sync_stage_with_action(machine, policy_decision.action)
-+        machine.apply_policy_decision(policy_decision)
-         decision = AgentDecision(
--            action="ask",
--            question=question,
-+            action=policy_decision.action,
-+            question=policy_decision.question,
-             stage=machine.data.stage,
-             notes=[note.__dict__ for note in notes],
-+            rationale=policy_decision.rationale,
+             peers = self._peers.setdefault(sid, set())
+             peers.add(ws)
+             peer_count = len(peers)
+             ready_event = self._ready_events.get(sid)
+             if ready_event is None:
+                 ready_event = asyncio.Event()
+                 self._ready_events[sid] = ready_event
+                 readiness_reset = True
+         LOGGER.info(
+             "Registered TTS peer sid=%s peers=%d readiness_reset=%s",
+             sid,
+             peer_count,
+             readiness_reset,
          )
-         await self._persist_turn(session_id=session_id, speaker=speaker, text=text, decision=decision)
-         return decision
+         try:
+             await ws.send_json({"type": "tts_ready", "mime": "audio/mpeg"})
+         except BaseException as exc:
+             readiness_reset = False
+@@ -78,50 +79,51 @@ class WsTtsManager:
  
-+    async def _decide_with_fallback(self, machine: StateMachine) -> PolicyDecision:
-+        try:
-+            return await decide_policy(machine.data)
-+        except PolicyError:
-+            return machine.rule_based_decision()
-+
-+    def _sync_stage_with_action(self, machine: StateMachine, action: str) -> None:
-+        if action == "clarify":
-+            machine.data.stage = InterviewStage.CLARIFY
-+        elif action == "close":
-+            machine.data.stage = InterviewStage.CLOSING
-+
-     async def _persist_turn(self, session_id: str, speaker: str, text: str, decision: AgentDecision) -> None:
-         async with SessionLocal() as db:  # open independent session outside FastAPI DI
-             session_obj = await db.get(Session, int(session_id))
-             if not session_obj:
-                 return
-             turn = Turn(
-                 session_id=session_obj.id,
-                 speaker=speaker,
-                 transcript=text,
-                 stage=decision.stage.value,
-                 llm_action=decision.action,
-+                llm_rationale=decision.rationale,
+             await self._maybe_close_websocket(ws)
+ 
+             LOGGER.warning(
+                 (
+                     "Failed to send readiness for sid=%s; dropping peer remaining=%d "
+                     "readiness_reset=%s client_state=%s app_state=%s close_code=%s exc_type=%s"
+                 ),
+                 sid,
+                 remaining,
+                 readiness_reset,
+                 getattr(ws, "client_state", None),
+                 getattr(ws, "application_state", None),
+                 getattr(ws, "close_code", None),
+                 type(exc).__name__,
+                 exc_info=True,
              )
-             db.add(turn)
-             for payload in decision.notes:
-                 note = Note(
-                     session_id=session_obj.id,
-                     category=payload["category"],
-                     content=payload["content"],
-                     confidence=payload["confidence"],
-                     requires_clarification=payload["requires_clarification"],
-                 )
-                 db.add(note)
-             await db.commit()
- 
- 
- agent_orchestrator = AgentOrchestrator()
-diff --git a/backend/app/services/outline.py b/backend/app/services/outline.py
-index d00085b2c1868f0326db7a2e4aee5e0d282b5447..6e7ee30e085d3f46e8aff2a8a478920fd5ff7e0f 100644
---- a/backend/app/services/outline.py
-+++ b/backend/app/services/outline.py
-@@ -1,30 +1,90 @@
- from __future__ import annotations
- 
-+import json
-+import logging
- from typing import Iterable
- 
-+from ..config import settings
-+from ..core import llm
-+
- from ..schemas import PlanQuestion, PlanResponse, PlanSection
- 
- 
-+LOGGER = logging.getLogger(__name__)
-+
-+
- DEFAULT_STAGES = [
-     ("背景", ["请介绍一下当前的业务背景", "团队目前的规模与分工情况如何？"]),
-     ("细节", ["这个项目的核心指标有哪些？", "在实施过程中遇到了什么挑战？"]),
-     ("结论", ["下一步的关键计划是什么？", "还需要哪些外部支持？"]),
- ]
- 
- 
- class OutlineBuilder:
-     """Generate structured three-level outlines."""
- 
--    def build(self, topic: str, seeds: Iterable[tuple[str, list[str]]] | None = None) -> PlanResponse:
--        blueprint = list(seeds or DEFAULT_STAGES)
-+    async def build(
-+        self,
-+        topic: str,
-+        seeds: Iterable[tuple[str, list[str]]] | None = None,
-+    ) -> PlanResponse:
-+        blueprint: list[tuple[str, list[str]]] | None = None
-+        if settings.llm_credentials_ready:
-+            messages = [
-+                {
-+                    "role": "system",
-+                    "content": (
-+                        "你是采访提纲助手，请基于主题生成三级递进的访谈提纲。"
-+                        "确保问题覆盖背景、细节、指标与行动项，回答 JSON 数组。"
-+                    ),
-+                },
-+                {
-+                    "role": "user",
-+                    "content": json.dumps(
-+                        {
-+                            "topic": topic,
-+                            "format": [
-+                                {"stage": "背景", "questions": []},
-+                                {"stage": "细节", "questions": []},
-+                                {"stage": "结论", "questions": []},
-+                            ],
-+                        },
-+                        ensure_ascii=False,
-+                    ),
-+                },
-+            ]
-+            buffer: list[str] = []
-+            try:
-+                async for chunk in llm.chat_stream(
-+                    messages,
-+                    model=settings.ark_outline_model_id or settings.ark_model_id,
-+                ):
-+                    buffer.append(chunk)
-+                raw = "".join(buffer).strip()
-+                if raw:
-+                    payload = json.loads(raw)
-+                    blueprint = []
-+                    for section in payload:
-+                        stage = section.get("stage")
-+                        questions = section.get("questions") or []
-+                        if not stage or not isinstance(questions, list):
-+                            continue
-+                        normalized = [str(question).strip() for question in questions if str(question).strip()]
-+                        if normalized:
-+                            blueprint.append((str(stage), normalized))
-+            except (llm.LLMNotConfiguredError, json.JSONDecodeError, TypeError, ValueError) as exc:
-+                LOGGER.warning("Ark outline generation failed, falling back to defaults: %s", exc)
-+                blueprint = None
-+        if blueprint is None:
-+            blueprint = list(seeds or DEFAULT_STAGES)
-         sections = [
-             PlanSection(
-                 stage=stage,
-                 questions=[PlanQuestion(question=q) for q in questions],
-             )
-             for stage, questions in blueprint
-         ]
-         return PlanResponse(topic=topic, sections=sections)
- 
- 
- outline_builder = OutlineBuilder()
-diff --git a/backend/app/services/policy.py b/backend/app/services/policy.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..3c876faf4bbe9808f9afedc63b946375e7952247
---- /dev/null
-+++ b/backend/app/services/policy.py
-@@ -0,0 +1,73 @@
-+from __future__ import annotations
-+
-+import json
-+import logging
-+from dataclasses import dataclass
-+
-+from ..config import settings
-+from ..core import llm
-+from .state_machine import ConversationState
-+
-+LOGGER = logging.getLogger(__name__)
-+
-+
-+@dataclass
-+class PolicyDecision:
-+    action: str
-+    question: str
-+    rationale: str
-+
-+
-+class PolicyError(RuntimeError):
-+    """Raised when policy decision generation fails."""
-+
-+
-+async def decide_policy(state: ConversationState) -> PolicyDecision:
-+    if not settings.llm_credentials_ready:
-+        raise PolicyError("Ark credentials missing")
-+
-+    payload = {
-+        "topic": state.topic,
-+        "stage": state.stage.value,
-+        "coverage": round(state.coverage(), 3),
-+        "pending_clarifications": list(state.pending_clarifications),
-+        "recent_turns": state.recent_turns(),
-+    }
-+    system_prompt = (
-+        "你是采访策略助手，需要根据最近的对话、提纲覆盖率和待澄清事项，"
-+        "选择下一步行动（ask/followup/clarify/regress/close），并给出追问。"
-+        "返回 JSON：{\"action\":..., \"question\":..., \"rationale\":...}。"
-+    )
-+    messages = [
-+        {"role": "system", "content": system_prompt},
-+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-+    ]
-+    chunks: list[str] = []
-+    try:
-+        async for part in llm.chat_stream(
-+            messages,
-+            model=settings.ark_policy_model_id or settings.ark_model_id,
-+        ):
-+            chunks.append(part)
-+    except llm.LLMNotConfiguredError as exc:
-+        raise PolicyError("Ark credentials missing") from exc
-+    raw = "".join(chunks).strip()
-+    if not raw:
-+        raise PolicyError("Empty response from policy model")
-+    try:
-+        data = json.loads(raw)
-+    except json.JSONDecodeError as exc:
-+        LOGGER.warning("Malformed policy response: %s", raw)
-+        raise PolicyError("Invalid JSON from policy model") from exc
-+    action = str(data.get("action") or "ask").strip()
-+    question = str(data.get("question") or "").strip()
-+    rationale = str(data.get("rationale") or "").strip()
-+    if not question:
-+        raise PolicyError("Policy response missing question")
-+    if action not in {"ask", "followup", "clarify", "regress", "close"}:
-+        LOGGER.debug("Unexpected action '%s' from policy, defaulting to ask", action)
-+        action = "ask"
-+    return PolicyDecision(action=action, question=question, rationale=rationale)
-+
-+
-+__all__ = ["PolicyDecision", "PolicyError", "decide_policy"]
-diff --git a/backend/app/services/state_machine.py b/backend/app/services/state_machine.py
-index 33753450c95e0a7fd5849d2dde796377f63d2cbd..5244984b40c28f73836bd982acbc264357c40719 100644
---- a/backend/app/services/state_machine.py
-+++ b/backend/app/services/state_machine.py
-@@ -1,87 +1,114 @@
- from __future__ import annotations
- 
- from dataclasses import dataclass, field
- from enum import Enum
--from typing import List
-+from typing import TYPE_CHECKING, List
-+
-+if TYPE_CHECKING:  # pragma: no cover
-+    from .policy import PolicyDecision
- 
- 
- class InterviewStage(str, Enum):
-     OPENING = "Opening"
-     EXPLORATION = "Exploration"
-     DEEP_DIVE = "DeepDive"
-     CLARIFY = "Clarify"
-     CLOSING = "Closing"
- 
- 
- @dataclass
- class ConversationState:
-     session_id: str
-     topic: str
-     outline_questions: List[str]
-     answered_questions: List[str] = field(default_factory=list)
-     stage: InterviewStage = InterviewStage.OPENING
-     pending_clarifications: List[str] = field(default_factory=list)
-     last_question: str | None = None
-+    turn_history: List[dict] = field(default_factory=list)
- 
-     def coverage(self) -> float:
-         if not self.outline_questions:
-             return 1.0
-         return len(self.answered_questions) / len(self.outline_questions)
- 
-     def mark_answered(self, question: str) -> None:
-         if question not in self.answered_questions:
-             self.answered_questions.append(question)
- 
-     def mark_last_answered(self) -> None:
-         if self.last_question:
-             self.mark_answered(self.last_question)
-             self.last_question = None
- 
-     def add_clarification(self, content: str) -> None:
-         if content not in self.pending_clarifications:
-             self.pending_clarifications.append(content)
- 
-     def resolve_clarification(self, content: str) -> None:
-         if content in self.pending_clarifications:
-             self.pending_clarifications.remove(content)
- 
-+    def add_turn(self, role: str, content: str) -> None:
-+        text = content.strip()
-+        if not text:
-+            return
-+        payload = {"role": role, "content": text}
-+        self.turn_history.append(payload)
-+        if len(self.turn_history) > 10:
-+            del self.turn_history[0 : len(self.turn_history) - 10]
-+
-+    def recent_turns(self, limit: int = 8) -> List[dict]:
-+        if limit <= 0:
-+            return []
-+        return self.turn_history[-limit:]
-+
- 
- class StateMachine:
-     def __init__(self, session_id: str, topic: str, outline_questions: List[str]):
-         self.data = ConversationState(session_id=session_id, topic=topic, outline_questions=outline_questions)
- 
-     def transition_after_answer(self) -> None:
-         self.data.mark_last_answered()
-         coverage = self.data.coverage()
-         if coverage > 0.75 and not self.data.pending_clarifications:
-             self.data.stage = InterviewStage.CLOSING
-         elif self.data.pending_clarifications:
-             self.data.stage = InterviewStage.CLARIFY
-         elif coverage > 0.4:
-             self.data.stage = InterviewStage.DEEP_DIVE
+             raise
          else:
-             self.data.stage = InterviewStage.EXPLORATION
+             ready_event.set()
+             LOGGER.info(
+                 "Marked TTS session sid=%s ready; notifying waiters peers=%d",
+                 sid,
+                 peer_count,
+             )
++            await self._flush_pending_json(sid)
  
--    def next_question(self) -> str:
-+    def record_user_turn(self, text: str) -> None:
-+        self.data.add_turn("user", text)
-+
-+    def apply_policy_decision(self, decision: "PolicyDecision") -> None:
-+        self.data.last_question = decision.question
-+        self.data.add_turn(
-+            "assistant",
-+            decision.question,
-+        )
-+
-+    def rule_based_decision(self) -> "PolicyDecision":
-+        from .policy import PolicyDecision
-+
-         unanswered = [q for q in self.data.outline_questions if q not in self.data.answered_questions]
-+        rationale = "rule-based fallback"
-         if self.data.stage == InterviewStage.CLARIFY and self.data.pending_clarifications:
-             question = f"关于『{self.data.pending_clarifications[0]}』能再具体说明一下吗？"
--            self.data.last_question = question
--            return question
-+            return PolicyDecision(action="clarify", question=question, rationale=rationale)
-         if self.data.stage == InterviewStage.CLOSING:
-             question = "感谢分享，我们来做个小结：还有哪些重点没有提到？"
--            self.data.last_question = question
--            return question
-+            return PolicyDecision(action="close", question=question, rationale=rationale)
-         if unanswered:
-             question = unanswered[0]
--            self.data.last_question = question
--            return question
-+            return PolicyDecision(action="ask", question=question, rationale=rationale)
-         question = "能否补充一个具体数据或案例，帮助我们理解？"
--        self.data.last_question = question
--        return question
-+        return PolicyDecision(action="ask", question=question, rationale=rationale)
+     async def unregister(self, sid: str, ws: WebSocket) -> None:
+         readiness_reset = False
+         peer_count = 0
+         async with self._lock:
+             peers = self._peers.get(sid)
+             if peers and ws in peers:
+                 peers.remove(ws)
+                 peer_count = len(peers)
+                 if not peers:
+                     self._peers.pop(sid, None)
+                     # reset readiness so future waiters block until a new socket arrives
+                     self._ready_events[sid] = asyncio.Event()
+                     readiness_reset = True
+             else:
+                 peer_count = len(peers) if peers else 0
+                 self._peers.pop(sid, None)
+                 ready_event = self._ready_events.get(sid)
+                 if ready_event is not None and ready_event.is_set():
+                     self._ready_events.pop(sid, None)
+                     readiness_reset = True
+         LOGGER.info(
+             "Unregistered TTS peer sid=%s peers=%d readiness_reset=%s",
+             sid,
+             peer_count,
+@@ -137,61 +139,77 @@ class WsTtsManager:
+                 self._ready_events[sid] = event
+                 created = True
+             already_ready = event.is_set()
+         LOGGER.info(
+             "Waiting for TTS readiness sid=%s created=%s already_ready=%s",
+             sid,
+             created,
+             already_ready,
+         )
+         await event.wait()
+         LOGGER.info("TTS readiness satisfied sid=%s", sid)
  
-     def register_clarification(self, content: str) -> None:
-         self.data.add_clarification(content)
+     async def _broadcast_bytes(self, sid: str, payload: bytes) -> None:
+         peers = list(self._peers.get(sid, ()))
+         to_drop: list[WebSocket] = []
+         for ws in peers:
+             try:
+                 await ws.send_bytes(payload)
+             except Exception:
+                 LOGGER.error("Dropping TTS peer sid=%s due to bytes send error", sid, exc_info=True)
+                 to_drop.append(ws)
+         for ws in to_drop:
+             await self.unregister(sid, ws)
+ 
+     async def _broadcast_json(self, sid: str, payload: dict) -> None:
+-        peers = list(self._peers.get(sid, ()))
++        async with self._lock:
++            peers = list(self._peers.get(sid, ()))
++            if not peers:
++                queue = self._pending_json.setdefault(sid, [])
++                queue.append(payload)
++                LOGGER.debug(
++                    "Queued JSON payload for sid=%s while no peers connected: %s",
++                    sid,
++                    payload,
++                )
++                return
+         to_drop: list[WebSocket] = []
+         for ws in peers:
+             try:
+                 await ws.send_json(payload)
+             except Exception:
+                 LOGGER.error("Dropping TTS peer sid=%s due to json send error", sid, exc_info=True)
+                 to_drop.append(ws)
+         for ws in to_drop:
+             await self.unregister(sid, ws)
+ 
++    async def _flush_pending_json(self, sid: str) -> None:
++        async with self._lock:
++            pending = self._pending_json.pop(sid, [])
++        for payload in pending:
++            await self._broadcast_json(sid, payload)
++
+     async def _maybe_close_websocket(self, ws: WebSocket) -> None:
+         close_callable = getattr(ws, "close", None)
+         if not close_callable:
+             return
+         try:
+             result = close_callable()  # type: ignore[operator]
+             if inspect.isawaitable(result):
+                 await result
+         except Exception:
+             LOGGER.debug("Suppressing websocket close error after failed register", exc_info=True)
+ 
+     async def send_audio_chunk(self, sid: str, chunk: bytes) -> None:
+         await self._broadcast_bytes(sid, chunk)
+ 
+     async def send_tts_end(self, sid: str) -> None:
+         await self._broadcast_json(sid, {"type": "tts_end"})
+ 
+     async def send_tts_error(self, sid: str, message: str) -> None:
+         await self._broadcast_json(sid, {"type": "tts_error", "message": message})
+ 
+     async def send_tts_fallback(self, sid: str, text: str) -> None:
+         await self._broadcast_json(sid, {"type": "tts_fallback", "text": text})
  
  
- __all__ = ["InterviewStage", "ConversationState", "StateMachine"]
-diff --git a/backend/requirements.txt b/backend/requirements.txt
-index 36bfa524423ed2d90c95efefe3585a29e8a33310..c724eee32a203c007763f0f40fe5da4bbdbbc167 100644
---- a/backend/requirements.txt
-+++ b/backend/requirements.txt
-@@ -1,8 +1,11 @@
- fastapi==0.111.0
- uvicorn[standard]==0.29.0
- sqlalchemy[asyncio]==2.0.31
- aiosqlite==0.20.0
- pydantic==2.7.1
- pydantic-settings==2.3.2
- openpyxl==3.1.2
- python-docx==1.1.0
-+aiohttp==3.9.5
-+pytest==8.2.1
-+pytest-asyncio==0.23.7
-diff --git a/backend/tests/conftest.py b/backend/tests/conftest.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..040877258933df6a0f1466f543ab29a01df7afd4
---- /dev/null
-+++ b/backend/tests/conftest.py
-@@ -0,0 +1,9 @@
-+from __future__ import annotations
-+
-+import sys
-+from pathlib import Path
-+
-+ROOT = Path(__file__).resolve().parents[2]
-+BACKEND_PATH = ROOT / "backend"
-+if str(BACKEND_PATH) not in sys.path:
-+    sys.path.insert(0, str(BACKEND_PATH))
-diff --git a/backend/tests/test_outline.py b/backend/tests/test_outline.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..71b444257d66eb91afee20f185f2dcf4bfd6040e
---- /dev/null
-+++ b/backend/tests/test_outline.py
-@@ -0,0 +1,48 @@
-+import asyncio
-+import json
-+import sys
-+from pathlib import Path
-+
-+ROOT = Path(__file__).resolve().parents[2]
-+BACKEND_PATH = ROOT / "backend"
-+if str(BACKEND_PATH) not in sys.path:
-+    sys.path.insert(0, str(BACKEND_PATH))
-+
-+from app.config import settings
-+from app.core import llm
-+from app.services.outline import OutlineBuilder, DEFAULT_STAGES
-+
-+
-+def test_outline_builder_uses_llm_when_configured(monkeypatch):
-+    builder = OutlineBuilder()
-+    monkeypatch.setattr(settings, "ark_base_url", "https://ark.example.com")
-+    monkeypatch.setattr(settings, "ark_api_key", "test-key")
-+    monkeypatch.setattr(settings, "ark_model_id", "ep-test")
-+
-+    async def fake_chat_stream(messages, **kwargs):
-+        payload = [
-+            {"stage": "背景", "questions": ["Q1", "Q2"]},
-+            {"stage": "细节", "questions": ["Q3"]},
-+        ]
-+        yield json.dumps(payload, ensure_ascii=False)
-+
-+    monkeypatch.setattr(llm, "chat_stream", fake_chat_stream)
-+    outline = asyncio.run(builder.build("测试主题"))
-+    assert [section.stage for section in outline.sections] == ["背景", "细节"]
-+    assert outline.sections[0].questions[0].question == "Q1"
-+
-+
-+def test_outline_builder_falls_back_on_error(monkeypatch):
-+    builder = OutlineBuilder()
-+    monkeypatch.setattr(settings, "ark_base_url", "https://ark.example.com")
-+    monkeypatch.setattr(settings, "ark_api_key", "test-key")
-+    monkeypatch.setattr(settings, "ark_model_id", "ep-test")
-+
-+    async def broken_chat_stream(messages, **kwargs):
-+        yield "{"  # malformed json
-+
-+    monkeypatch.setattr(llm, "chat_stream", broken_chat_stream)
-+    outline = asyncio.run(builder.build("测试主题"))
-+    assert [(stage, len(questions)) for stage, questions in DEFAULT_STAGES] == [
-+        (section.stage, len(section.questions)) for section in outline.sections
-+    ]
-diff --git a/backend/tests/test_policy.py b/backend/tests/test_policy.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..fff800f642eae0e058c82c346c3a780c6725dc49
---- /dev/null
-+++ b/backend/tests/test_policy.py
-@@ -0,0 +1,73 @@
-+import asyncio
-+import json
-+import sys
-+from pathlib import Path
-+
-+import pytest
-+
-+ROOT = Path(__file__).resolve().parents[2]
-+BACKEND_PATH = ROOT / "backend"
-+if str(BACKEND_PATH) not in sys.path:
-+    sys.path.insert(0, str(BACKEND_PATH))
-+
-+from app.config import settings
-+from app.core import llm
-+from app.services.agent import AgentOrchestrator
-+from app.services.policy import PolicyError, decide_policy
-+from app.services.state_machine import InterviewStage, StateMachine
-+from app.schemas import PlanQuestion, PlanResponse, PlanSection
+     def start_stream(self, sid: str, task: asyncio.Task) -> CancellationToken:
+diff --git a/backend/tests/test_tts_client.py b/backend/tests/test_tts_client.py
+index 83c8fda4441c17bea50455914870a9f92216d9fc..a207cf6c572f83a972af71864f57a35ad69a8888 100644
+--- a/backend/tests/test_tts_client.py
++++ b/backend/tests/test_tts_client.py
+@@ -1,34 +1,35 @@
+ from __future__ import annotations
+ 
+ import base64
+ from typing import Iterable, List
+ 
+ import pytest
+ import asyncio
+ from types import SimpleNamespace
+ from app.core import tts_client
++from app.core.ws_tts_manager import WsTtsManager
+ 
+ 
+ class DummyResponse:
+     def __init__(self, *, content_type: str, body: bytes, status: int = 200) -> None:
+         self.headers = {"Content-Type": content_type}
+         self._body = body
+         self.status = status
+ 
+     async def read(self) -> bytes:
+         return self._body
+ 
+     async def __aenter__(self) -> "DummyResponse":
+         return self
+ 
+     async def __aexit__(self, exc_type, exc, tb) -> bool:
+         return False
+ 
+ 
+ class DummySession:
+     def __init__(self, responses: Iterable[DummyResponse]) -> None:
+         self._responses: List[DummyResponse] = list(responses)
+ 
+     async def __aenter__(self) -> "DummySession":
+         return self
+ 
+@@ -176,26 +177,73 @@ async def test_stream_and_broadcast_times_out_waiting_for_ws(monkeypatch: pytest
+         async def send_audio_chunk(self, sid: str, chunk: bytes) -> None:  # pragma: no cover - unused
+             raise AssertionError("audio should not be streamed when websocket never becomes ready")
+ 
+         def finish_stream(self, sid: str, task: asyncio.Task) -> None:
+             recorded["finished"] = True
+ 
+     dummy_manager = DummyManager()
+     monkeypatch.setattr(tts_client, "ws_manager", dummy_manager)
+ 
+     synth_called = False
+ 
+     async def fail_synth(text: str) -> bytes:  # pragma: no cover - should not be called
+         nonlocal synth_called
+         synth_called = True
+         return b""
+ 
+     monkeypatch.setattr(tts_client, "synth_once", fail_synth)
+ 
+     await tts_client.stream_and_broadcast("s-timeout", "超时测试")
+ 
+     assert recorded["ready_calls"] == 1
+     assert recorded["error"] == "语音合成连接超时，已使用浏览器朗读。"
+     assert recorded["fallback"] == "超时测试"
+     assert recorded["end"] is True
+     assert recorded["finished"] is True
+-    assert synth_called is False
+\ No newline at end of file
 +
 +
-+def test_policy_payload_includes_clarifications_and_coverage(monkeypatch):
-+    monkeypatch.setattr(settings, "ark_base_url", "https://ark.example.com")
-+    monkeypatch.setattr(settings, "ark_api_key", "test-key")
-+    monkeypatch.setattr(settings, "ark_model_id", "ep-test")
++class DummyWebSocket:
++    def __init__(self) -> None:
++        self.accepted = False
++        self.sent_json: list[dict] = []
 +
-+    machine = StateMachine(session_id="1", topic="测试主题", outline_questions=["Q1", "Q2", "Q3"])
-+    machine.data.answered_questions.extend(["Q1", "Q2"])
-+    machine.data.pending_clarifications.append("缺少 KPI 数字")
-+    machine.data.stage = InterviewStage.CLARIFY
-+    machine.data.add_turn("assistant", "Q1")
-+    machine.data.add_turn("user", "A1")
++    async def accept(self) -> None:
++        self.accepted = True
 +
-+    captured: dict = {}
-+
-+    async def fake_chat_stream(messages, **kwargs):
-+        captured["messages"] = messages
-+        yield json.dumps(
-+            {
-+                "action": "clarify",
-+                "question": "请补充缺失的 KPI 数字",
-+                "rationale": "clarification required",
-+            },
-+            ensure_ascii=False,
-+        )
-+
-+    monkeypatch.setattr(llm, "chat_stream", fake_chat_stream)
-+    decision = asyncio.run(decide_policy(machine.data))
-+    assert decision.action == "clarify"
-+    payload = json.loads(captured["messages"][1]["content"])
-+    assert payload["pending_clarifications"] == ["缺少 KPI 数字"]
-+    assert pytest.approx(payload["coverage"], rel=0.0) == 0.667
-+    assert payload["stage"] == InterviewStage.CLARIFY.value
++    async def send_json(self, payload: dict) -> None:
++        self.sent_json.append(payload)
 +
 +
-+def test_agent_fallback_uses_rule_based_clarification(monkeypatch):
-+    orchestrator = AgentOrchestrator()
-+    outline = PlanResponse(
-+        topic="测试主题",
-+        sections=[
-+            PlanSection(stage="背景", questions=[PlanQuestion(question="请介绍背景")]),
-+        ],
-+    )
-+    machine = asyncio.run(orchestrator.ensure_session("42", "测试主题", outline))
-+    machine.data.stage = InterviewStage.CLARIFY
-+    machine.register_clarification("缺少预算")
++@pytest.mark.asyncio
++async def test_timeout_then_late_websocket_receives_cached_payload(monkeypatch: pytest.MonkeyPatch) -> None:
++    manager = WsTtsManager()
++    monkeypatch.setattr(tts_client, "ws_manager", manager)
++    monkeypatch.setattr(tts_client, "WS_READY_TIMEOUT", 0.01)
++    monkeypatch.setattr(tts_client, "VOLC_TTS_URL", "https://example.test/tts")
++    monkeypatch.setattr(tts_client, "VOLC_TTS_KEY", "key")
++    monkeypatch.setattr(tts_client, "VOLC_TTS_RES", "resource")
 +
-+    async def raise_policy(*args, **kwargs):
-+        raise PolicyError("boom")
++    synth_called = False
 +
-+    monkeypatch.setattr("backend.app.services.agent.decide_policy", raise_policy)
-+    decision = asyncio.run(orchestrator.bootstrap_decision("42"))
-+    assert decision.action == "clarify"
-+    assert "缺少预算" in decision.question
++    async def synth_stub(_: str) -> bytes:  # pragma: no cover - not expected to run
++        nonlocal synth_called
++        synth_called = True
++        return b""
++
++    monkeypatch.setattr(tts_client, "synth_once", synth_stub)
++
++    text = "晚到的客户端"
++    await tts_client.stream_and_broadcast("sid-late", text)
++
++    ws = DummyWebSocket()
++    await manager.register("sid-late", ws)
++
++    assert ws.accepted is True
++    assert ws.sent_json[0] == {"type": "tts_ready", "mime": "audio/mpeg"}
++    assert ws.sent_json[1] == {
++        "type": "tts_error",
++        "message": "语音合成连接超时，已使用浏览器朗读。",
++    }
++    assert ws.sent_json[2] == {"type": "tts_fallback", "text": text}
++    assert ws.sent_json[3] == {"type": "tts_end"}
++    assert "sid-late" not in manager._pending_json
++    assert synth_called is False

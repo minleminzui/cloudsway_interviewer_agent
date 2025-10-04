@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict
 
 from ..models import Note, Session, Turn
@@ -18,9 +18,10 @@ class AgentDecision:
     action: str
     question: str
     stage: InterviewStage
-    notes: list[dict]
     rationale: str
-    new_notes: list[dict]
+    notes: list[dict] = field(default_factory=list)
+    new_notes: list[dict] = field(default_factory=list)
+
 
 
 class AgentOrchestrator:
@@ -44,7 +45,6 @@ class AgentOrchestrator:
 
     async def bootstrap_decision(self, session_id: str) -> AgentDecision:
         machine = self._machines[session_id]
-        machine.record_user_turn(text)
         policy_decision = await self._decide_with_fallback(machine)
         self._sync_stage_with_action(machine, policy_decision.action)
         machine.apply_policy_decision(policy_decision)
@@ -52,7 +52,6 @@ class AgentOrchestrator:
             action=policy_decision.action,
             question=policy_decision.question,
             stage=machine.data.stage,
-            notes=[],
             rationale=policy_decision.rationale,
         )
 

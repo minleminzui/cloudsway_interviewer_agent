@@ -69,7 +69,7 @@ async def chat_stream(
     if extra_headers:
         headers.update(extra_headers)
 
-    url = f"{settings.ark_base_url.rstrip('/')}/v1/chat/completions"
+    url = f"{settings.ark_base_url.rstrip('/')}/chat/completions"
     timeout = aiohttp.ClientTimeout(total=60)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:

@@ -1,7 +1,5 @@
 # Interviewer Agent MVP
 
-This repository contains a runnable minimum viable product of the multi模态采访机器人. It ships a FastAPI backend with WebSocket channels for ASR、Agent 决策、TTS，并提供结构化纪要导出，同时配套一个 React + Vite 控制台用于演示「自动提问 → 受访者回答 → 实时记录 → 下一轮追问」的闭环。
-
 ## 功能概览
 
 - **会话管理与提纲生成**：后端提供 `/v1/sessions` 创建接口，自动生成三级采访提纲并初始化状态机。
@@ -48,16 +46,34 @@ This repository contains a runnable minimum viable product of the multi模态采
 - Node.js 20+
 - 推荐在项目根目录复制 `.env.example` 为 `.env` 并按需修改。
 
-若需启用 Ark LLM 生成提纲与策略，请在 `.env` 中增加以下配置：
+若需启用 Ark LLM 生成提纲与策略，可在 `.env` 写入变量，或在启动终端先执行一次：
 
-```
-ARK_BASE_URL=https://ark.example.com
-ARK_API_KEY=sk-***
-ARK_MODEL_ID=ep-xxxx
+```bash
+export ARK_BASE_URL="https://ark.cn-beijing.volces.com/api/v3"
+export ARK_API_KEY="<你的 Ark API Key>"
+export ARK_MODEL_ID="<默认聊天模型 ID>"
 # 可选：分别为提纲与策略指定模型
-ARK_OUTLINE_MODEL_ID=ep-outline
-ARK_POLICY_MODEL_ID=ep-policy
+export ARK_OUTLINE_MODEL_ID="<提纲模型 ID>"
+export ARK_POLICY_MODEL_ID="<策略模型 ID>"
 ```
+
+语音服务也需要在当前终端导出凭据：
+
+```bash
+export VOLC_TTS_BASE_URL="https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+export VOLC_TTS_API_KEY="<你的 TTS API Key>"
+export VOLC_TTS_RESOURCE_ID="volc.service_type.10029"
+export VOLC_TTS_SPEAKER="zh_male_beijingxiaoye_emo_v2_mars_bigtts"
+export VOLC_TTS_SAMPLE_RATE="24000"
+export VOLC_TTS_FORMAT="mp3"
+
+export VOLS_APPID="<你的火山 ASR AppId>"
+export VOLS_TOKEN="<你的火山 ASR Token>"
+export VOLS_CLUSTER="volcengine_streaming"
+export VOLS_WS_URL="wss://openspeech.bytedance.com/api/v2/asr"
+```
+
+将这些命令写入 `.env` 文件也可以，FastAPI 会在启动时自动加载。
 
 ### 启动后端
 
@@ -66,6 +82,7 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+# 首次运行请确保已经在该终端执行过上面的 export 命令
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -129,7 +146,7 @@ VOLC_TTS_SPEAKER=zh_male_beijingxiaoye_emo_v2_mars_bigtts
 VOLC_TTS_SAMPLE_RATE=24000
 VOLC_TTS_FORMAT=mp3
 
-ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+ARK_BASE_URL=https://ark.example.com/api/v3
 ARK_API_KEY=__PUT_YOUR_ARK_KEY__
 ARK_MODEL_ID=ep-XXXXXXXXXXXX
 ```
@@ -144,3 +161,10 @@ ffmpeg -y -i sample.mp3 -c:a libopus -b:a 64k -frame_duration 20 -application vo
 随后访问前端 `/tts-demo` 页面即可触发 demo 播放并测试 barge-in 打断。
 
 如需更细颗粒的迭代拆解，可参考 `docs/auto_interview_mvp.md` 中的实施细化方案。
+
+## 提示词设置
+初始化采访时使用的默认“背景/细节/结论”提纲和示例问题定义在 `backend/app/services/outline.py`的 DEFAULT_STAGES 常量中；直接修改那里就能调整默认的采访背景与种子问题。
+
+如果启用了 Ark 模型，提纲生成时发送给模型的系统提示词也在同一文件里（messages 列表中的 "你是采访提纲助手..." 等内容）；你可以在那里定制模型接收的上下文，以改变自动生成的初始提纲风格。
+
+另外，正式对话阶段的策略提示词位于 backend/app/services/policy.py 的 system_prompt 中，它控制后续问题的生成逻辑；如需调整采访策略，可在这里修改提示词或传入的 payload 信息。

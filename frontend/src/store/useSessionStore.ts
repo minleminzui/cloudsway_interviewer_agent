@@ -17,6 +17,10 @@ type NoteEntry = {
   confidence?: number;
 };
 
+type TtsMode = 'stream' | 'fallback' | 'error';
+
+type MicStatus = 'idle' | 'starting' | 'recording' | 'error';
+
 type SessionState = {
   sessionId: string;
   topic: string;
@@ -26,6 +30,13 @@ type SessionState = {
   stage: string;
   notes: NoteEntry[];
   ttsReady: boolean;
+  ttsMode: TtsMode;
+  ttsError: string | null;
+  ttsFallbackText: string | null;
+  ttsFallbackNeedUserAction: boolean;
+  ttsFallbackRetry: (() => void) | null;
+  micStatus: MicStatus;
+  micError: string | null;
   setSession: (payload: { sessionId: string; topic: string }) => void;
   setOutline: (sections: OutlineSection[]) => void;
   addTranscript: (entry: TranscriptEntry) => void;
@@ -33,6 +44,13 @@ type SessionState = {
   setStage: (stage: string) => void;
   updateNotes: (notes: NoteEntry[]) => void;
   setTtsReady: (ready: boolean) => void;
+  setTtsMode: (mode: TtsMode) => void;
+  setTtsError: (error: string | null) => void;
+  setTtsFallbackText: (text: string | null) => void;
+  setTtsFallbackNeedUserAction: (need: boolean) => void;
+  setTtsFallbackRetry: (handler: (() => void) | null) => void;
+  setMicStatus: (status: MicStatus) => void;
+  setMicError: (error: string | null) => void;
   reset: () => void;
 };
 
@@ -45,6 +63,13 @@ export const useSessionStore = create<SessionState>((set) => ({
   stage: 'Opening',
   notes: [],
   ttsReady: false,
+  ttsMode: 'stream',
+  ttsError: null,
+  ttsFallbackText: null,
+  ttsFallbackNeedUserAction: false,
+  ttsFallbackRetry: null,
+  micStatus: 'idle',
+  micError: null,
   setSession: ({ sessionId, topic }) => set(() => ({ sessionId, topic })),
   setOutline: (sections) => set(() => ({ outline: sections })),
   addTranscript: (entry) => set((state) => ({ transcript: [...state.transcript, entry] })),
@@ -65,6 +90,13 @@ export const useSessionStore = create<SessionState>((set) => ({
       return { notes: Array.from(map.values()) };
     }),
   setTtsReady: (ready) => set(() => ({ ttsReady: ready })),
+  setTtsMode: (mode) => set(() => ({ ttsMode: mode })),
+  setTtsError: (error) => set(() => ({ ttsError: error })),
+  setTtsFallbackText: (text) => set(() => ({ ttsFallbackText: text })),
+  setTtsFallbackNeedUserAction: (need) => set(() => ({ ttsFallbackNeedUserAction: need })),
+  setTtsFallbackRetry: (handler) => set(() => ({ ttsFallbackRetry: handler })),
+  setMicStatus: (status) => set(() => ({ micStatus: status })),
+  setMicError: (error) => set(() => ({ micError: error })),
   reset: () =>
     set(() => ({
       sessionId: '0',
@@ -74,6 +106,13 @@ export const useSessionStore = create<SessionState>((set) => ({
       pendingQuestion: '',
       stage: 'Opening',
       notes: [],
-      ttsReady: false
+      ttsReady: false,
+      ttsMode: 'stream',
+      ttsError: null,
+      ttsFallbackText: null,
+      ttsFallbackNeedUserAction: false,
+      ttsFallbackRetry: null,
+      micStatus: 'idle',
+      micError: null
     }))
 }));

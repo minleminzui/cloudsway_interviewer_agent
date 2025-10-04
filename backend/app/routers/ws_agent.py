@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import json
 
 import asyncio
@@ -12,6 +13,7 @@ from ..services.agent import agent_orchestrator
 from ..services.outline import outline_builder
 from ..utils.ws_manager import WebSocketManager
 
+LOGGER = logging.getLogger(__name__)
 router = APIRouter()
 manager = WebSocketManager()
 
@@ -30,12 +32,13 @@ async def websocket_agent(websocket: WebSocket) -> None:
         {
             "type": "policy",
             "action": first_decision.action,
-            "question": first_question,
+            "question": first_decision.question,
             "stage": machine.data.stage.value,
             "notes": [],
+            "rationale": first_decision.rationale,
         },
     )
-    asyncio.create_task(stream_and_broadcast(session_id, first_decision.action))
+    asyncio.create_task(stream_and_broadcast(session_id, first_decision.question))
     try:
         while True:
             data = await websocket.receive_json()
@@ -63,4 +66,12 @@ async def websocket_agent(websocket: WebSocket) -> None:
             elif event_type == "control":
                 await manager.send_json(session_id, {"type": "ack", "event": data.get("command", "")})
     except WebSocketDisconnect:
+        pass
+    except RuntimeError as exc:
+        if "WebSocket is not connected" in str(exc):
+            LOGGER.debug("Agent websocket closed before accept: %s", exc)
+        else:
+            LOGGER.exception("Unexpected agent websocket runtime error")
+            raise
+    finally:
         manager.disconnect(session_id)

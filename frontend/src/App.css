@@ -122,6 +122,66 @@ main {
   border-top: 1px solid rgba(148, 163, 184, 0.3);
 }
 
+.control-bar .mic-control {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.35rem;
+  min-width: 140px;
+}
+
+.control-bar .mic-button {
+  padding: 0.6rem 1.2rem;
+  border-radius: 999px;
+  border: none;
+  background: #059669;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease;
+}
+
+.control-bar .mic-button.recording {
+  background: #dc2626;
+}
+
+.control-bar .mic-button.starting {
+  background: #f59e0b;
+}
+
+.control-bar .mic-button:disabled {
+  cursor: not-allowed;
+  background: rgba(148, 163, 184, 0.7);
+}
+
+.mic-status-label {
+  font-size: 0.85rem;
+  color: #475569;
+}
+
+.mic-status-label.recording {
+  color: #059669;
+  font-weight: 600;
+}
+
+.mic-status-label.starting {
+  color: #d97706;
+  font-weight: 600;
+}
+
+.mic-status-label.error {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.mic-error-hint {
+  font-size: 0.78rem;
+  color: #b91c1c;
+  background: rgba(248, 113, 113, 0.12);
+  border-radius: 6px;
+  padding: 0.25rem 0.5rem;
+}
+
 .control-bar input {
   flex: 1;
   padding: 0.8rem 1rem;
@@ -170,4 +230,64 @@ main {
 
 .tts-status.waiting {
   background: rgba(248, 113, 113, 0.35);
+}
+
+.tts-status.fallback {
+  background: rgba(251, 191, 36, 0.45);
+}
+
+.tts-status.error {
+  background: rgba(248, 113, 113, 0.6);
+}
+
+.tts-banner {
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.9rem;
+  line-height: 1.4;
+  font-weight: 500;
+  margin: 0 2rem 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.tts-banner.waiting {
+  background: rgba(59, 130, 246, 0.12);
+  color: #1d4ed8;
+}
+
+.tts-banner.fallback {
+  background: rgba(251, 191, 36, 0.18);
+  color: #b45309;
+}
+
+.tts-banner.error {
+  background: rgba(248, 113, 113, 0.16);
+  color: #b91c1c;
+}
+
+.tts-retry-button {
+  border: none;
+  background: #1d4ed8;
+  color: #fff;
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.85rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  box-shadow: 0 3px 10px rgba(29, 78, 216, 0.25);
+}
+
+.tts-retry-button:hover {
+  background: #1e40af;
+}
+
+.tts-retry-button:focus-visible {
+  outline: 2px solid #1e3a8a;
+  outline-offset: 2px;
 }
