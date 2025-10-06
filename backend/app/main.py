@@ -10,7 +10,7 @@ from .routers import demo_tts, http_api, ws_agent, ws_asr, ws_tts
 app = FastAPI(title=settings.app_name)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allow_origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

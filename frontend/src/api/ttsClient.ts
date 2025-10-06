@@ -1,10 +1,12 @@
+// src/api/ttsClient.ts
 import { TtsPlayer } from '../audio/TtsPlayer';
 import { useSessionStore } from '../store/useSessionStore';
 
 function makeWsUrl(baseUrl: string, path: string) {
-  const url = new URL(path, baseUrl);
-  url.protocol = url.protocol.replace('http', 'ws');
-  return url.toString();
+  const backendHost = window.location.hostname;
+  const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsPort = 8000; // ✅ 后端端口
+  return `${wsProtocol}//${backendHost}:${wsPort}${path}`;
 }
 
 export class TtsClient {
@@ -23,9 +25,15 @@ export class TtsClient {
 
   constructor(private readonly baseUrl: string, private readonly sessionId: string) {}
 
+  /** ✅ 公有 getter，用于外部安全读取 sessionId */
+  public getSessionId(): string {
+    return this.sessionId;
+  }
+
   connect() {
     this.ensurePlayer();
     this.ensureSpeechVoices();
+
     const wsUrl = makeWsUrl(this.baseUrl, `/ws/tts?session=${this.sessionId}`);
     this.ws = new WebSocket(wsUrl);
     this.ws.binaryType = 'arraybuffer';
@@ -41,79 +49,27 @@ export class TtsClient {
       this.fallbackText = null;
       this.updateFallbackState(null, false);
       this.clearFallbackWatchdog();
+
+      setTimeout(() => {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          console.info('[tts] handshake confirmed alive', { sessionId: this.sessionId });
+        }
+      }, 500);
     };
 
     this.ws.onerror = (event) => {
       console.error('[tts] websocket error', event);
+      setTtsError('TTS WebSocket 连接出错');
     };
 
     this.ws.onmessage = (event) => {
       if (typeof event.data === 'string') {
-        try {
-          const payload = JSON.parse(event.data);
-          if (payload.type === 'tts_ready') {
-            if (typeof payload.mime === 'string' && payload.mime) {
-              this.playerMime = payload.mime;
-              this.ensurePlayer(payload.mime);
-            }
-            this.ready = true;
-            setTtsReady(true);
-            setTtsMode('stream');
-            setTtsError(null);
-            console.info('[tts] stream ready', { mime: this.playerMime, sessionId: this.sessionId });
-            return;
-          }
-          if (payload.type === 'tts_end') {
-            this.player?.finalize();
-            if (this.player && (this.player.isUsingMediaSource() || !this.player.isBlobPlaybackActive())) {
-              this.player.prepare();
-            }
-            return;
-          }
-          if (payload.type === 'tts_error') {
-            this.player?.cancel();
-            if (this.player && (this.player.isUsingMediaSource() || !this.player.isBlobPlaybackActive())) {
-              this.player.prepare();
-            }
-            const message =
-              typeof payload.message === 'string' && payload.message ? payload.message : 'TTS 服务发生错误';
-            this.ready = false;
-            setTtsReady(false);
-            setTtsMode('error');
-            setTtsError(message);
-            console.error('[tts] backend reported error', { message });
-            return;
-          }
-          if (payload.type === 'tts_fallback') {
-            const text = typeof payload.text === 'string' ? payload.text : '';
-            const fallbackMessage =
-              typeof payload.message === 'string' && payload.message
-                ? payload.message
-                : useSessionStore.getState().ttsError ?? 'TTS 流未就绪，已切换到浏览器语音播报。';
-            this.ready = false;
-            setTtsReady(false);
-            console.warn('[tts] backend requested fallback, switching to browser speech', {
-              reason: fallbackMessage,
-              sessionId: this.sessionId,
-            });
-            this.speakFallback(text, fallbackMessage);
-            return;
-          }
-        } catch (error) {
-          console.warn('[tts] failed to parse control message', error);
-        }
+        this.handleControlMessage(event.data);
         return;
       }
-      if (!this.ready) {
-        // Drop audio chunks until the connection is acknowledged.
-        return;
-      }
+      if (!this.ready) return;
       const chunk = event.data as ArrayBuffer;
-      if (!this.player) {
-        console.warn('[tts] received audio chunk without active player, dropping');
-        return;
-      }
-      this.player.enqueue(chunk);
+      this.player?.enqueue(chunk);
     };
 
     this.ws.onclose = (event) => {
@@ -133,17 +89,59 @@ export class TtsClient {
     };
   }
 
+  private handleControlMessage(raw: string) {
+    const { setTtsReady, setTtsMode, setTtsError } = useSessionStore.getState();
+    try {
+      const payload = JSON.parse(raw);
+      switch (payload.type) {
+        case 'tts_ready':
+          if (payload.mime) this.playerMime = payload.mime;
+          this.ensurePlayer(this.playerMime);
+          this.ready = true;
+          setTtsReady(true);
+          setTtsMode('stream');
+          console.info('[tts] stream ready', { mime: this.playerMime, sessionId: this.sessionId });
+          break;
+
+        case 'tts_end':
+          this.player?.finalize();
+          break;
+
+        case 'tts_error':
+          this.player?.cancel();
+          this.ready = false;
+          setTtsReady(false);
+          setTtsMode('error');
+          setTtsError(payload.message || 'TTS 服务发生错误');
+          console.error('[tts] backend reported error', payload.message);
+          break;
+
+        case 'tts_fallback':
+          this.ready = false;
+          setTtsReady(false);
+          this.speakFallback(payload.text || '', payload.message);
+          break;
+
+        default:
+          console.warn('[tts] unknown control message', payload);
+      }
+    } catch (err) {
+      console.warn('[tts] failed to parse control message', err);
+    }
+  }
+
   cancelPlayback() {
     this.player?.cancel();
-    if (this.player && (this.player.isUsingMediaSource() || !this.player.isBlobPlaybackActive())) {
-      this.player.prepare();
-    }
     this.cancelSpeechFallback();
   }
 
   close() {
-    this.cancelPlayback();
-    this.ws?.close();
+    try {
+      this.cancelPlayback();
+      this.ws?.close();
+    } catch (e) {
+      console.warn('[tts] close error', e);
+    }
     this.ws = null;
     this.player?.destroy();
     this.player = null;
@@ -159,140 +157,76 @@ export class TtsClient {
     this.player.prepare();
   }
 
+  // ============== Fallback Speech (浏览器语音播报) ==============
   private speakFallback(text: string, reason?: string) {
-    const fallbackReason = reason && reason.trim().length > 0 ? reason : '已切换到浏览器语音播报。';
+    const fallbackReason = reason?.trim() || '已切换到浏览器语音播报。';
     this.fallbackReason = fallbackReason;
     this.fallbackText = text || null;
     this.updateFallbackState(this.fallbackText, false);
     this.updateTtsMode('fallback', fallbackReason);
     this.ensureFallbackUserActionListener();
-    if (!text) {
-      console.debug('[tts] fallback invoked without text payload');
-      return;
-    }
+
+    if (!text) return;
+
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
       console.error('[tts] browser does not support speech synthesis');
-      this.updateTtsMode('error', '当前浏览器不支持语音合成，无法播放备用音频。');
-      this.updateFallbackState(this.fallbackText, false);
+      this.updateTtsMode('error', '浏览器不支持语音合成');
       return;
     }
+
     const synth = window.speechSynthesis;
-    const voices = synth.getVoices();
-    console.debug('[tts] speech synthesis voice snapshot', {
-      availableVoices: voices.length,
-    });
-    if (!this.speechVoicesReady && voices.length === 0) {
+    if (!this.speechVoicesReady && synth.getVoices().length === 0) {
       this.pendingSpeech.push(text);
       this.ensureSpeechVoices();
-      console.debug('[tts] queued fallback speech until voices load', { queueLength: this.pendingSpeech.length });
       return;
     }
+
     this.speechVoicesReady = true;
-    try {
-      synth.cancel();
-      if (typeof synth.resume === 'function') {
-        try {
-          synth.resume();
-        } catch (resumeError) {
-          console.debug('[tts] resume call on speech synthesis failed', resumeError);
-        }
-      }
-      const utterance = this.buildUtterance(text);
-      console.info('[tts] speaking via browser speech synthesis', {
-        textPreview: text.slice(0, 40),
-        characters: text.length,
-        voice: utterance.voice ? utterance.voice.name : 'default',
-        sessionId: this.sessionId,
-      });
-      synth.speak(utterance);
-      this.startFallbackWatchdog();
-    } catch (error) {
-      console.warn('[tts] browser speech synthesis failed', error);
-      this.updateTtsMode('error', this.extractErrorMessage(error, '浏览器语音合成失败'));
-      this.updateFallbackState(this.fallbackText, false);
-    }
+    synth.cancel();
+    const utterance = this.buildUtterance(text);
+    synth.speak(utterance);
+    this.startFallbackWatchdog();
   }
 
   private ensureSpeechVoices() {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      return;
-    }
-    if (this.speechVoicesReady) {
-      return;
-    }
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     const synth = window.speechSynthesis;
     const voices = synth.getVoices();
     if (voices.length > 0) {
       this.speechVoicesReady = true;
       this.flushPendingSpeech();
-      console.debug('[tts] speech synthesis voices became available (immediate)', {
-        voices: voices.map((voice) => ({ name: voice.name, lang: voice.lang })),
-      });
       return;
     }
-    if (this.voicesChangedHandler) {
-      return;
-    }
+    if (this.voicesChangedHandler) return;
     this.voicesChangedHandler = () => {
       this.speechVoicesReady = true;
       this.flushPendingSpeech();
-      const available = synth.getVoices();
-      console.debug('[tts] speech synthesis voices ready (event)', {
-        voices: available.map((voice) => ({ name: voice.name, lang: voice.lang })),
-      });
     };
     synth.addEventListener('voiceschanged', this.voicesChangedHandler, { once: true });
-    // Trigger lazy voice loading on some browsers (e.g. Safari)
-    synth.getVoices();
+    synth.getVoices(); // 触发懒加载
   }
 
   private flushPendingSpeech() {
-    if (!this.speechVoicesReady || this.pendingSpeech.length === 0) {
-      return;
-    }
-    const synth = window.speechSynthesis;
+    if (!this.speechVoicesReady || this.pendingSpeech.length === 0) return;
     const texts = this.pendingSpeech.splice(0);
-    console.debug('[tts] flushing queued fallback speech', { count: texts.length });
     for (const text of texts) {
-      try {
-        synth.cancel();
-        const utterance = this.buildUtterance(text);
-        synth.speak(utterance);
-        this.startFallbackWatchdog();
-      } catch (error) {
-        console.warn('[tts] browser speech synthesis failed', error);
-        this.updateTtsMode('error', this.extractErrorMessage(error, '浏览器语音合成失败'));
-        this.updateFallbackState(this.fallbackText, false);
-      }
+      const utterance = this.buildUtterance(text);
+      window.speechSynthesis.speak(utterance);
     }
   }
 
   private cancelSpeechFallback() {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      return;
-    }
-    this.pendingSpeech = [];
-    this.clearFallbackWatchdog();
-    try {
-      window.speechSynthesis.cancel();
-    } catch (error) {
-      console.warn('[tts] cancel speech synthesis failed', error);
-    }
+    if (!('speechSynthesis' in window)) return;
+    window.speechSynthesis.cancel();
     this.fallbackText = null;
+    this.clearFallbackWatchdog();
     this.updateFallbackState(null, false);
     this.teardownFallbackUserActionListener();
   }
 
   private teardownVoicesListener() {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      return;
-    }
-    if (this.voicesChangedHandler) {
-      try {
-        window.speechSynthesis.removeEventListener('voiceschanged', this.voicesChangedHandler);
-      } catch {
-        // ignore
-      }
+    if (this.voicesChangedHandler && 'speechSynthesis' in window) {
+      window.speechSynthesis.removeEventListener('voiceschanged', this.voicesChangedHandler);
       this.voicesChangedHandler = null;
     }
   }
@@ -300,87 +234,36 @@ export class TtsClient {
   private updateTtsMode(mode: 'stream' | 'fallback' | 'error', error?: string | null) {
     const { setTtsMode, setTtsError } = useSessionStore.getState();
     setTtsMode(mode);
-    if (error !== undefined) {
-      setTtsError(error);
-    }
+    if (error) setTtsError(error);
   }
 
   private buildUtterance(text: string) {
     const utterance = new SpeechSynthesisUtterance(text);
-    const synth = window.speechSynthesis;
-    const voices = synth.getVoices();
-    const preferredVoice = voices.find((voice) => voice.lang?.toLowerCase().startsWith('zh')) ?? voices[0];
-    if (preferredVoice) {
-      utterance.voice = preferredVoice;
-      utterance.lang = preferredVoice.lang || 'zh-CN';
+    const voices = window.speechSynthesis.getVoices();
+    const preferred = voices.find((v) => v.lang?.startsWith('zh')) ?? voices[0];
+    if (preferred) {
+      utterance.voice = preferred;
+      utterance.lang = preferred.lang;
     } else {
-      if (voices.length === 0) {
-        console.warn('[tts] no speech synthesis voices available; relying on browser default');
-      } else {
-        console.warn('[tts] no Chinese voice available; using first voice as fallback', {
-          fallbackVoice: voices[0]?.name,
-        });
-      }
       utterance.lang = 'zh-CN';
     }
-    const startTimestamp = Date.now();
-    utterance.onstart = () => {
-      console.info('[tts] fallback speech started', {
-        voice: preferredVoice ? preferredVoice.name : 'default',
-        lang: utterance.lang,
-        characters: text.length,
-      });
-      this.clearFallbackWatchdog();
-      this.updateFallbackState(this.fallbackText, false);
-      this.teardownFallbackUserActionListener();
-    };
     utterance.onend = () => {
-      console.info('[tts] fallback speech finished', {
-        voice: preferredVoice ? preferredVoice.name : 'default',
-        durationMs: Date.now() - startTimestamp,
-      });
       this.updateTtsMode('fallback', this.fallbackReason);
-      this.clearFallbackWatchdog();
-      this.updateFallbackState(this.fallbackText, false);
-      this.teardownFallbackUserActionListener();
+      this.updateFallbackState(null, false);
     };
-    utterance.onerror = (event) => {
-      const errorMessage =
-        (event.error && typeof event.error === 'string'
-          ? `浏览器语音合成失败：${event.error}`
-          : this.fallbackReason) || '浏览器语音合成失败';
-      console.error('[tts] fallback speech error', event);
-      this.updateTtsMode('error', errorMessage);
-      this.clearFallbackWatchdog();
-      this.updateFallbackState(this.fallbackText, false);
-    };
-    utterance.onpause = () => {
-      console.debug('[tts] fallback speech paused');
-    };
-    utterance.onresume = () => {
-      console.debug('[tts] fallback speech resumed');
+    utterance.onerror = (e) => {
+      console.error('[tts] fallback utterance error', e);
+      this.updateTtsMode('error', '语音合成失败');
     };
     return utterance;
   }
 
   private startFallbackWatchdog() {
-    if (typeof window === 'undefined') {
-      return;
-    }
-    if (this.fallbackWatchTimer !== null) {
-      window.clearTimeout(this.fallbackWatchTimer);
-    }
+    if (this.fallbackWatchTimer) clearTimeout(this.fallbackWatchTimer);
     this.fallbackWatchTimer = window.setTimeout(() => {
       if (!window.speechSynthesis.speaking) {
-        const message =
-          this.fallbackReason ?? '浏览器尚未开始朗读，请点击页面任意位置后重试。';
-        console.warn('[tts] speech synthesis has not started within expected window', {
-          pending: window.speechSynthesis.pending,
-          speaking: window.speechSynthesis.speaking,
-          sessionId: this.sessionId,
-        });
-        this.fallbackReason = message;
-        this.updateTtsMode('fallback', message);
+        const msg = this.fallbackReason ?? '请点击页面后再试';
+        this.updateTtsMode('fallback', msg);
         this.updateFallbackState(this.fallbackText, true);
         this.ensureFallbackUserActionListener();
       }
@@ -388,8 +271,8 @@ export class TtsClient {
   }
 
   private clearFallbackWatchdog() {
-    if (this.fallbackWatchTimer !== null) {
-      window.clearTimeout(this.fallbackWatchTimer);
+    if (this.fallbackWatchTimer) {
+      clearTimeout(this.fallbackWatchTimer);
       this.fallbackWatchTimer = null;
     }
   }
@@ -401,57 +284,29 @@ export class TtsClient {
   }
 
   retryFallbackSpeech() {
-    if (!this.fallbackText) {
-      console.warn('[tts] manual fallback retry requested but no text available');
-      this.updateFallbackState(null, false);
-      return;
-    }
-    console.info('[tts] manual fallback retry triggered');
-    this.updateFallbackState(this.fallbackText, false);
+    if (!this.fallbackText) return;
     this.speakFallback(this.fallbackText, this.fallbackReason ?? undefined);
   }
 
   private ensureFallbackUserActionListener() {
-    if (typeof document === 'undefined') {
-      return;
-    }
-    if (!this.fallbackText) {
-      return;
-    }
-    if (this.fallbackUserActionListener) {
-      return;
-    }
+    if (!document || !this.fallbackText) return;
+    if (this.fallbackUserActionListener) return;
     const handler = () => {
-      console.info('[tts] detected user interaction, retrying fallback speech');
+      console.info('[tts] user interaction detected, retrying fallback');
       this.teardownFallbackUserActionListener();
       this.retryFallbackSpeech();
     };
     this.fallbackUserActionListener = handler;
-    for (const eventName of this.fallbackUserActionEvents) {
-      document.addEventListener(eventName, handler, { once: true });
+    for (const e of this.fallbackUserActionEvents) {
+      document.addEventListener(e, handler, { once: true });
     }
   }
 
   private teardownFallbackUserActionListener() {
-    if (typeof document === 'undefined') {
-      return;
-    }
-    if (!this.fallbackUserActionListener) {
-      return;
-    }
-    for (const eventName of this.fallbackUserActionEvents) {
-      document.removeEventListener(eventName, this.fallbackUserActionListener);
+    if (!this.fallbackUserActionListener) return;
+    for (const e of this.fallbackUserActionEvents) {
+      document.removeEventListener(e, this.fallbackUserActionListener);
     }
     this.fallbackUserActionListener = null;
-  }
-
-  private extractErrorMessage(error: unknown, fallback: string) {
-    if (error instanceof Error && error.message) {
-      return error.message;
-    }
-    if (typeof error === 'string' && error) {
-      return error;
-    }
-    return fallback;
   }
 }

@@ -1,3 +1,4 @@
+// src/audio/TtsPlayer.ts
 export class TtsPlayer {
   private audio: HTMLAudioElement;
   private mediaSource: MediaSource | null = null;
@@ -9,33 +10,58 @@ export class TtsPlayer {
   private useMediaSource = false;
   private blobPlaybackActive = false;
   private forceBlobPlayback = false;
+  private autoplayUnlocked = false;
 
   private readonly handleBlobPlaybackEnded = () => {
     this.blobPlaybackActive = false;
     this.prepare();
   };
 
-  constructor(mime: string = 'audio/mpeg') {
+  constructor(mime: string = 'audio/ogg; codecs="opus"') {
     this.audio = new Audio();
     this.audio.preload = 'auto';
+    this.audio.autoplay = true;
+    this.audio.muted = true; // ✅ 初始静音以绕过浏览器 autoplay 限制
     this.mime = mime;
+
+    // ✅ 自动注册点击 / 键盘交互监听（仅一次）
+    const unlockPlayback = () => {
+      if (!this.autoplayUnlocked) {
+        this.autoplayUnlocked = true;
+        this.audio.muted = false;
+        console.info('[tts] 🎧 user interacted, unmuted audio playback');
+      }
+      document.removeEventListener('click', unlockPlayback);
+      document.removeEventListener('keydown', unlockPlayback);
+    };
+    document.addEventListener('click', unlockPlayback, { once: true });
+    document.addEventListener('keydown', unlockPlayback, { once: true });
+
+    console.info('[tts] Player initialized', {
+      mime: this.mime,
+      autoplay: this.audio.autoplay,
+      muted: this.audio.muted,
+    });
   }
 
   prepare() {
     this.queue = [];
     this.blobChunks = [];
-    if (this.blobPlaybackActive) {
-      return;
-    }
+    if (this.blobPlaybackActive) return;
+
     this.disposeMediaSource();
     this.useMediaSource = this.canUseMediaSource();
+
     if (this.useMediaSource) {
       this.mediaSource = new MediaSource();
       const objectUrl = URL.createObjectURL(this.mediaSource);
       this.objectUrl = objectUrl;
       this.audio.src = objectUrl;
+
+      console.info('[tts] preparing MediaSource for stream', { mime: this.mime });
       this.mediaSource.addEventListener('sourceopen', () => this.handleSourceOpen(), { once: true });
     } else {
+      console.warn('[tts] MediaSource not supported, will use blob fallback');
       this.resetAudioElement();
     }
   }
@@ -43,31 +69,34 @@ export class TtsPlayer {
   enqueue(chunk: ArrayBuffer) {
     if (this.useMediaSource) {
       this.queue.push(chunk);
-      if (this.queue.length === 1) {
-        console.debug('[tts] queued first streaming chunk', { byteLength: chunk.byteLength });
-      }
+      console.debug('[tts] enqueue chunk', {
+        chunkBytes: chunk.byteLength,
+        pendingQueue: this.queue.length,
+      });
       this.drain();
       return;
     }
+
     this.blobChunks.push(chunk.slice(0));
-    if (this.blobChunks.length === 1) {
-      console.debug('[tts] buffering first blob chunk', { byteLength: chunk.byteLength });
-    }
+    console.debug('[tts] buffering blob chunk', { byteLength: chunk.byteLength });
   }
 
   private drain() {
     if (!this.useMediaSource || !this.sourceBuffer || this.sourceBuffer.updating) return;
     const chunk = this.queue.shift();
-    if (!chunk) {
-      return;
-    }
+    if (!chunk) return;
+
     try {
       this.sourceBuffer.appendBuffer(new Uint8Array(chunk));
+      console.debug('[tts] appended chunk', {
+        appended: chunk.byteLength,
+        remaining: this.queue.length,
+      });
       if (this.audio.paused) {
-        void this.audio.play().catch(() => undefined);
+        void this.safePlay();
       }
     } catch (error) {
-      console.warn('[tts] append buffer failed, resetting player', error);
+      console.warn('[tts] appendBuffer failed, resetting player', error);
       this.cancel();
     }
   }
@@ -75,34 +104,37 @@ export class TtsPlayer {
   finalize() {
     if (this.useMediaSource) {
       if (this.mediaSource && this.mediaSource.readyState === 'open') {
-        try {
-          this.mediaSource.endOfStream();
-        } catch (error) {
-          console.warn('[tts] endOfStream failed', error);
-        }
+        const tryEnd = () => {
+          if (this.sourceBuffer && this.sourceBuffer.updating) {
+            setTimeout(tryEnd, 100);
+            return;
+          }
+          try {
+            this.mediaSource!.endOfStream();
+            console.debug('[tts] MediaSource endOfStream called');
+          } catch (err) {
+            console.warn('[tts] endOfStream retry failed', err);
+          }
+        };
+        tryEnd();
       }
       return;
     }
-    if (this.blobChunks.length === 0) {
-      return;
-    }
+
+    if (this.blobChunks.length === 0) return;
     const blob = new Blob(this.blobChunks, { type: this.mime });
     this.queue = [];
     this.revokeObjectUrl();
     this.objectUrl = URL.createObjectURL(blob);
     this.audio.src = this.objectUrl;
     this.blobChunks = [];
+
     this.audio.removeEventListener('ended', this.handleBlobPlaybackEnded);
     this.audio.addEventListener('ended', this.handleBlobPlaybackEnded, { once: true });
     this.blobPlaybackActive = true;
+
     console.debug('[tts] prepared blob playback', { mime: this.mime, size: blob.size });
-    const playPromise = this.audio.play();
-    if (typeof playPromise?.catch === 'function') {
-      playPromise.catch(() => {
-        this.audio.removeEventListener('ended', this.handleBlobPlaybackEnded);
-        this.blobPlaybackActive = false;
-      });
-    }
+    void this.safePlay();
   }
 
   pause() {
@@ -135,6 +167,27 @@ export class TtsPlayer {
     this.audio.remove();
   }
 
+  private async safePlay() {
+    try {
+      await this.audio.play();
+      console.debug('[tts] playback started successfully');
+    } catch (err: any) {
+      if (err.name === 'NotAllowedError') {
+        console.warn('[tts] autoplay blocked by browser, waiting for user interaction');
+        const unlock = () => {
+          console.info('[tts] user clicked, retrying playback');
+          this.audio.play().catch(() => {});
+          document.removeEventListener('click', unlock);
+          document.removeEventListener('keydown', unlock);
+        };
+        document.addEventListener('click', unlock, { once: true });
+        document.addEventListener('keydown', unlock, { once: true });
+      } else {
+        console.warn('[tts] playback failed', err);
+      }
+    }
+  }
+
   private disposeMediaSource() {
     this.clearBlobPlaybackListener();
     if (this.sourceBuffer && this.mediaSource) {
@@ -151,16 +204,18 @@ export class TtsPlayer {
   }
 
   private handleSourceOpen() {
-    if (!this.mediaSource) {
-      return;
-    }
+    if (!this.mediaSource) return;
+    console.debug('[tts] handleSourceOpen called', { mime: this.mime });
+
     const fallbackToBlob = () => {
+      console.warn('[tts] fallbackToBlob triggered');
       this.useMediaSource = false;
       this.forceBlobPlayback = true;
       this.blobChunks.push(...this.queue.map((chunk) => chunk.slice(0)));
       this.queue = [];
       this.disposeMediaSource();
     };
+
     try {
       if (typeof MediaSource.isTypeSupported === 'function' && !MediaSource.isTypeSupported(this.mime)) {
         console.warn('[tts] mime not supported by MediaSource', this.mime);
@@ -168,24 +223,24 @@ export class TtsPlayer {
         return;
       }
       this.sourceBuffer = this.mediaSource.addSourceBuffer(this.mime);
+      console.debug('[tts] sourceBuffer created successfully');
     } catch (error) {
       console.warn('[tts] addSourceBuffer failed, falling back to Blob playback', error);
       fallbackToBlob();
       return;
     }
-    if (!this.sourceBuffer) {
-      return;
-    }
+
+    if (!this.sourceBuffer) return;
     this.sourceBuffer.mode = 'sequence';
     this.sourceBuffer.addEventListener('updateend', () => this.drain());
     this.drain();
   }
 
   private canUseMediaSource() {
-    if (this.forceBlobPlayback) {
-      return false;
-    }
-    return typeof MediaSource !== 'undefined';
+    if (this.forceBlobPlayback) return false;
+    const supported = typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported?.(this.mime);
+    console.debug('[tts] canUseMediaSource', { supported, mime: this.mime });
+    return !!supported;
   }
 
   private resetAudioElement() {
