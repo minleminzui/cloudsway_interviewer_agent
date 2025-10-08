@@ -1,3 +1,4 @@
+// frontend/src/App.tsx
 import { createBrowserRouter, RouterProvider } from 'react-router-dom';
 import MainConsole from './pages/MainConsole';
 import TtsDemoPage from './pages/TtsDemoPage';

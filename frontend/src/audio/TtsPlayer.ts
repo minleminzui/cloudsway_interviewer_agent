@@ -1,270 +1,192 @@
 // src/audio/TtsPlayer.ts
+const DEBUG_TTS = true;
+
 export class TtsPlayer {
   private audio: HTMLAudioElement;
-  private mediaSource: MediaSource | null = null;
-  private sourceBuffer: SourceBuffer | null = null;
-  private queue: ArrayBuffer[] = [];
-  private blobChunks: ArrayBuffer[] = [];
-  private mime: string;
   private objectUrl: string | null = null;
-  private useMediaSource = false;
-  private blobPlaybackActive = false;
-  private forceBlobPlayback = false;
-  private autoplayUnlocked = false;
+  private mime = "audio/mpeg";
+  private blobChunks: BlobPart[] = [];
+  private destroyed = false;
+  private unlockPromptEl: HTMLDivElement | null = null;
 
-  private readonly handleBlobPlaybackEnded = () => {
-    this.blobPlaybackActive = false;
-    this.prepare();
-  };
+  constructor(mime?: string) {
+    if (mime) this.mime = mime;
 
-  constructor(mime: string = 'audio/ogg; codecs="opus"') {
     this.audio = new Audio();
-    this.audio.preload = 'auto';
     this.audio.autoplay = true;
-    this.audio.muted = true; // ✅ 初始静音以绕过浏览器 autoplay 限制
-    this.mime = mime;
+    this.audio.muted = false;
+    this.audio.volume = 1;
+    this.audio.preload = "auto";
+    this.audio.controls = false;
 
-    // ✅ 自动注册点击 / 键盘交互监听（仅一次）
-    const unlockPlayback = () => {
-      if (!this.autoplayUnlocked) {
-        this.autoplayUnlocked = true;
-        this.audio.muted = false;
-        console.info('[tts] 🎧 user interacted, unmuted audio playback');
-      }
-      document.removeEventListener('click', unlockPlayback);
-      document.removeEventListener('keydown', unlockPlayback);
-    };
-    document.addEventListener('click', unlockPlayback, { once: true });
-    document.addEventListener('keydown', unlockPlayback, { once: true });
+    // 兼容 iOS 行内播放
+    this.audio.setAttribute("playsinline", "");
+    this.audio.setAttribute("webkit-playsinline", "true");
 
-    console.info('[tts] Player initialized', {
-      mime: this.mime,
-      autoplay: this.audio.autoplay,
-      muted: this.audio.muted,
-    });
+    // 确保 <audio> 在 DOM 中（不可见）
+    this.audio.style.position = "fixed";
+    this.audio.style.left = "-10000px";
+    this.audio.style.top = "0";
+    this.audio.style.width = "1px";
+    this.audio.style.height = "1px";
+    this.audio.style.opacity = "0";
+    this.audio.setAttribute("aria-hidden", "true");
+    document.body.appendChild(this.audio);
+
+    this.audio.onplaying = () => DEBUG_TTS && console.info("[tts] ▶️ onplaying");
+    this.audio.onended = () => DEBUG_TTS && console.info("[tts] ⏹️ onended");
+    this.audio.onerror = (e) => DEBUG_TTS && console.error("[tts] audio error", e);
+
+    DEBUG_TTS &&
+      console.info("[tts] Player initialized", {
+        mime: this.mime,
+        autoplay: this.audio.autoplay,
+        muted: this.audio.muted,
+      });
   }
 
-  prepare() {
-    this.queue = [];
+  /** 兼容旧调用签名；内部不使用该参数 */
+  prepare(_forceBlob?: boolean) {
+    if (this.destroyed) return;
     this.blobChunks = [];
-    if (this.blobPlaybackActive) return;
-
-    this.disposeMediaSource();
-    this.useMediaSource = this.canUseMediaSource();
-
-    if (this.useMediaSource) {
-      this.mediaSource = new MediaSource();
-      const objectUrl = URL.createObjectURL(this.mediaSource);
-      this.objectUrl = objectUrl;
-      this.audio.src = objectUrl;
-
-      console.info('[tts] preparing MediaSource for stream', { mime: this.mime });
-      this.mediaSource.addEventListener('sourceopen', () => this.handleSourceOpen(), { once: true });
-    } else {
-      console.warn('[tts] MediaSource not supported, will use blob fallback');
-      this.resetAudioElement();
-    }
+    this.stopInternal();
+    console.warn("[tts] Fallback to Blob playback");
   }
 
   enqueue(chunk: ArrayBuffer) {
-    if (this.useMediaSource) {
-      this.queue.push(chunk);
-      console.debug('[tts] enqueue chunk', {
-        chunkBytes: chunk.byteLength,
-        pendingQueue: this.queue.length,
-      });
-      this.drain();
-      return;
-    }
-
-    this.blobChunks.push(chunk.slice(0));
-    console.debug('[tts] buffering blob chunk', { byteLength: chunk.byteLength });
+    if (this.destroyed) return;
+    const part = new Uint8Array(chunk);
+    this.blobChunks.push(part);
+    DEBUG_TTS && console.info("[tts] 📦 enqueue", part.byteLength);
   }
 
-  private drain() {
-    if (!this.useMediaSource || !this.sourceBuffer || this.sourceBuffer.updating) return;
-    const chunk = this.queue.shift();
-    if (!chunk) return;
+  async finalize() {
+    if (this.destroyed) return;
+    if (this.blobChunks.length === 0) {
+      DEBUG_TTS && console.warn("[tts] no blobChunks to finalize");
+      return;
+    }
 
     try {
-      this.sourceBuffer.appendBuffer(new Uint8Array(chunk));
-      console.debug('[tts] appended chunk', {
-        appended: chunk.byteLength,
-        remaining: this.queue.length,
-      });
-      if (this.audio.paused) {
-        void this.safePlay();
-      }
-    } catch (error) {
-      console.warn('[tts] appendBuffer failed, resetting player', error);
-      this.cancel();
+      const blob = new Blob(this.blobChunks, { type: this.mime || "audio/mpeg" });
+      DEBUG_TTS && console.info("[tts] 🔚 finalize: blob size:", blob.size, "type:", blob.type);
+
+      this.revokeObjectUrl();
+      this.objectUrl = URL.createObjectURL(blob);
+
+      this.audio.src = this.objectUrl;
+      this.audio.load();
+
+      // 监听就绪事件，尝试播放
+      const tryNow = () => void this.tryPlayWithUnlock();
+      this.audio.addEventListener("loadeddata", tryNow, { once: true });
+      this.audio.addEventListener("canplay", tryNow, { once: true });
+      this.audio.addEventListener("canplaythrough", tryNow, { once: true });
+
+      // 也马上尝试一次
+      await this.tryPlayWithUnlock();
+    } catch (err) {
+      console.error("[tts] blob finalize failed:", err);
+    } finally {
+      this.blobChunks = [];
     }
-  }
-
-  finalize() {
-    if (this.useMediaSource) {
-      if (this.mediaSource && this.mediaSource.readyState === 'open') {
-        const tryEnd = () => {
-          if (this.sourceBuffer && this.sourceBuffer.updating) {
-            setTimeout(tryEnd, 100);
-            return;
-          }
-          try {
-            this.mediaSource!.endOfStream();
-            console.debug('[tts] MediaSource endOfStream called');
-          } catch (err) {
-            console.warn('[tts] endOfStream retry failed', err);
-          }
-        };
-        tryEnd();
-      }
-      return;
-    }
-
-    if (this.blobChunks.length === 0) return;
-    const blob = new Blob(this.blobChunks, { type: this.mime });
-    this.queue = [];
-    this.revokeObjectUrl();
-    this.objectUrl = URL.createObjectURL(blob);
-    this.audio.src = this.objectUrl;
-    this.blobChunks = [];
-
-    this.audio.removeEventListener('ended', this.handleBlobPlaybackEnded);
-    this.audio.addEventListener('ended', this.handleBlobPlaybackEnded, { once: true });
-    this.blobPlaybackActive = true;
-
-    console.debug('[tts] prepared blob playback', { mime: this.mime, size: blob.size });
-    void this.safePlay();
-  }
-
-  pause() {
-    this.audio.pause();
   }
 
   cancel() {
-    this.queue = [];
-    this.blobChunks = [];
-    this.clearBlobPlaybackListener();
-    if (this.useMediaSource) {
-      if (this.sourceBuffer && this.mediaSource?.readyState === 'open') {
-        try {
-          this.sourceBuffer.abort();
-        } catch (error) {
-          console.warn('[tts] abort error', error);
-        }
-      }
-      this.disposeMediaSource();
-    } else {
-      this.revokeObjectUrl();
-      this.resetAudioElement();
-    }
-    this.audio.pause();
-    this.audio.currentTime = 0;
+    this.stopInternal();
   }
 
   destroy() {
-    this.cancel();
-    this.audio.remove();
-  }
-
-  private async safePlay() {
+    this.destroyed = true;
+    this.stopInternal();
     try {
-      await this.audio.play();
-      console.debug('[tts] playback started successfully');
-    } catch (err: any) {
-      if (err.name === 'NotAllowedError') {
-        console.warn('[tts] autoplay blocked by browser, waiting for user interaction');
-        const unlock = () => {
-          console.info('[tts] user clicked, retrying playback');
-          this.audio.play().catch(() => {});
-          document.removeEventListener('click', unlock);
-          document.removeEventListener('keydown', unlock);
-        };
-        document.addEventListener('click', unlock, { once: true });
-        document.addEventListener('keydown', unlock, { once: true });
-      } else {
-        console.warn('[tts] playback failed', err);
-      }
-    }
+      this.audio.remove();
+    } catch {}
+    if (this.unlockPromptEl) this.unlockPromptEl.remove();
   }
 
-  private disposeMediaSource() {
-    this.clearBlobPlaybackListener();
-    if (this.sourceBuffer && this.mediaSource) {
-      try {
-        this.mediaSource.removeSourceBuffer(this.sourceBuffer);
-      } catch {
-        // ignore
-      }
-    }
-    this.mediaSource = null;
-    this.sourceBuffer = null;
+  // --- 内部 ---
+  private stopInternal() {
+    try {
+      this.audio.pause();
+    } catch {}
+    this.audio.removeAttribute("src");
+    try {
+      this.audio.load();
+    } catch {}
     this.revokeObjectUrl();
-    this.resetAudioElement();
-  }
-
-  private handleSourceOpen() {
-    if (!this.mediaSource) return;
-    console.debug('[tts] handleSourceOpen called', { mime: this.mime });
-
-    const fallbackToBlob = () => {
-      console.warn('[tts] fallbackToBlob triggered');
-      this.useMediaSource = false;
-      this.forceBlobPlayback = true;
-      this.blobChunks.push(...this.queue.map((chunk) => chunk.slice(0)));
-      this.queue = [];
-      this.disposeMediaSource();
-    };
-
-    try {
-      if (typeof MediaSource.isTypeSupported === 'function' && !MediaSource.isTypeSupported(this.mime)) {
-        console.warn('[tts] mime not supported by MediaSource', this.mime);
-        fallbackToBlob();
-        return;
-      }
-      this.sourceBuffer = this.mediaSource.addSourceBuffer(this.mime);
-      console.debug('[tts] sourceBuffer created successfully');
-    } catch (error) {
-      console.warn('[tts] addSourceBuffer failed, falling back to Blob playback', error);
-      fallbackToBlob();
-      return;
-    }
-
-    if (!this.sourceBuffer) return;
-    this.sourceBuffer.mode = 'sequence';
-    this.sourceBuffer.addEventListener('updateend', () => this.drain());
-    this.drain();
-  }
-
-  private canUseMediaSource() {
-    if (this.forceBlobPlayback) return false;
-    const supported = typeof MediaSource !== 'undefined' && MediaSource.isTypeSupported?.(this.mime);
-    console.debug('[tts] canUseMediaSource', { supported, mime: this.mime });
-    return !!supported;
-  }
-
-  private resetAudioElement() {
-    this.audio.removeAttribute('src');
-    this.audio.load();
   }
 
   private revokeObjectUrl() {
     if (this.objectUrl) {
-      URL.revokeObjectURL(this.objectUrl);
+      try {
+        URL.revokeObjectURL(this.objectUrl);
+      } catch {}
       this.objectUrl = null;
     }
   }
 
-  private clearBlobPlaybackListener() {
-    this.audio.removeEventListener('ended', this.handleBlobPlaybackEnded);
-    this.blobPlaybackActive = false;
+  private showUnlockPrompt() {
+    if (this.unlockPromptEl || document.getElementById("__tts-unlock-tip")) return;
+
+    const box = document.createElement("div");
+    box.id = "__tts-unlock-tip";
+    box.textContent = "🔊 点击开启音频";
+    box.style.cssText =
+      "position:fixed;right:16px;bottom:16px;padding:10px 12px;border-radius:12px;background:#111;color:#fff;font:14px/1.2 system-ui;cursor:pointer;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.2);opacity:.92";
+    const click = () => {
+      this.unlock().catch(() => {});
+      box.remove();
+      this.unlockPromptEl = null;
+    };
+    box.addEventListener("click", click, { once: true });
+    document.body.appendChild(box);
+    this.unlockPromptEl = box;
   }
 
-  isUsingMediaSource() {
-    return this.useMediaSource;
+  /** 主播放逻辑；若被策略拦截，则等待下一次用户手势解锁 */
+  private async tryPlayWithUnlock() {
+    if (!this.audio.src) return;
+
+    try {
+      this.audio.muted = false;
+      this.audio.volume = 1;
+      await this.audio.play();
+      DEBUG_TTS && console.info("[tts] ▶️ play() ok");
+      return;
+    } catch (err: any) {
+      DEBUG_TTS && console.warn("[tts] play() rejected:", err?.name || String(err));
+    }
+
+    // 被自动播放策略拦截：挂一次性手势监听，提示用户点击开启音频
+    const unlock = async () => {
+      document.removeEventListener("pointerdown", unlock);
+      document.removeEventListener("keydown", unlock);
+      document.removeEventListener("touchend", unlock);
+      await this.unlock();
+    };
+
+    document.addEventListener("pointerdown", unlock, { once: true, passive: true });
+    document.addEventListener("keydown", unlock, { once: true });
+    document.addEventListener("touchend", unlock, { once: true, passive: true });
+
+    this.showUnlockPrompt();
   }
 
-  isBlobPlaybackActive() {
-    return this.blobPlaybackActive;
+  /** 暴露一个可手动调用的解锁方法（可在按钮/任意点击时调用） */
+  public async unlock() {
+    if (!this.audio.src) return;
+    try {
+      // 先静音播放 → 让播放状态进入“允许”
+      this.audio.muted = true;
+      await this.audio.play().catch(() => {});
+      // 下一帧取消静音并确保在播
+      await new Promise((r) => setTimeout(r, 60));
+      this.audio.muted = false;
+      await this.audio.play();
+      DEBUG_TTS && console.info("[tts] ▶️ play() ok after gesture");
+    } catch (e) {
+      DEBUG_TTS && console.warn("[tts] still blocked after gesture:", (e as any)?.name || e);
+    }
   }
 }

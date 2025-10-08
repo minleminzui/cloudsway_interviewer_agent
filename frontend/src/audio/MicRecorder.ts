@@ -1,4 +1,4 @@
-import { useSessionStore } from '../store/useSessionStore';
+import { useSessionStore } from "../store/useSessionStore";
 
 export type MicCallbacks = {
   onReady: (info: { sampleRate: number }) => Promise<void> | void;
@@ -6,141 +6,153 @@ export type MicCallbacks = {
   onStop?: () => void;
 };
 
+/**
+ * 🔊 改进版 MicRecorder
+ * - 使用 AudioWorkletProcessor（Edge / Chrome 均稳定）
+ * - 实时推流 16kHz PCM16
+ */
 export class MicRecorder {
-  private audioContext: AudioContext | null = null;
-  private processor: ScriptProcessorNode | null = null;
-  private source: MediaStreamAudioSourceNode | null = null;
+  private ctx: AudioContext | null = null;
+  private workletNode: AudioWorkletNode | null = null;
   private mediaStream: MediaStream | null = null;
-  private gain: GainNode | null = null;
   private capturing = false;
-
   private callbacks: MicCallbacks | null = null;
+  private targetRate = 16000;
 
   async start(callbacks: MicCallbacks): Promise<void> {
     if (this.capturing) {
-      console.warn('[mic] start called while capturing; ignoring');
+      console.warn("[mic] start called while capturing");
       return;
     }
 
-    const setMicStatus = useSessionStore.getState().setMicStatus;
-    const setMicError = useSessionStore.getState().setMicError;
-
-    setMicStatus('starting');
-    setMicError(null);
+    const store = useSessionStore.getState();
+    store.setMicStatus("starting");
+    store.setMicError(null);
 
     try {
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        }
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
       });
-      console.info('[mic] media stream acquired', this.mediaStream.getAudioTracks().map((track) => track.label));
-    } catch (error) {
-      console.error('[mic] failed to acquire media stream', error);
-      setMicStatus('error');
-      setMicError(error instanceof Error ? error.message : '无法访问麦克风');
-      throw error;
+      console.info("[mic] ✅ getUserMedia success");
+    } catch (err) {
+      console.error("[mic] ❌ getUserMedia failed", err);
+      store.setMicStatus("error");
+      store.setMicError("无法访问麦克风");
+      throw err;
     }
 
-    try {
-      this.audioContext = new AudioContext({ sampleRate: 48000 });
-      await this.audioContext.resume();
-    } catch (error) {
-      console.error('[mic] failed to initialise AudioContext', error);
-      setMicStatus('error');
-      setMicError('浏览器不支持音频上下文');
-      this.stop();
-      throw error;
-    }
+    // 🔹 创建 AudioContext + 加载 Worklet
+    this.ctx = new AudioContext({ sampleRate: 48000 });
+    await this.ctx.audioWorklet.addModule(
+      URL.createObjectURL(
+        new Blob(
+          [
+            `
+            class MicProcessor extends AudioWorkletProcessor {
+              constructor() {
+                super();
+                this._buf = [];
+                this._lastSend = 0;
+              }
+              process(inputs) {
+                const ch = inputs[0][0];
+                if (!ch) return true;
+                const now = currentTime;
+                this._buf.push(new Float32Array(ch));
+                if (now - this._lastSend > 0.2) { // 每200ms推一次
+                  const merged = this._merge();
+                  this.port.postMessage(merged);
+                  this._buf = [];
+                  this._lastSend = now;
+                }
+                return true;
+              }
+              _merge() {
+                const len = this._buf.reduce((a,b)=>a+b.length,0);
+                const out = new Float32Array(len);
+                let off=0;
+                for(const c of this._buf){out.set(c,off);off+=c.length;}
+                return out;
+              }
+            }
+            registerProcessor('mic-processor', MicProcessor);
+            `,
+          ],
+          { type: "application/javascript" }
+        )
+      )
+    );
 
-    const context = this.audioContext;
-    if (!context) {
-      throw new Error('音频上下文初始化失败');
-    }
-    const actualRate = context.sampleRate;
-    console.info('[mic] audio context ready', { actualRate });
-    try {
-      await callbacks.onReady({ sampleRate: actualRate });
-    } catch (error) {
-      console.error('[mic] onReady callback rejected', error);
-      setMicStatus('error');
-      setMicError(error instanceof Error ? error.message : '麦克风初始化失败');
-      this.stop();
-      throw error;
-    }
+    const src = this.ctx.createMediaStreamSource(this.mediaStream);
+    this.workletNode = new AudioWorkletNode(this.ctx, "mic-processor");
+    src.connect(this.workletNode);
+    this.workletNode.connect(this.ctx.destination);
 
-    const bufferSize = 4096;
-    this.processor = context.createScriptProcessor(bufferSize, 1, 1);
-    this.processor.onaudioprocess = (event) => {
-      if (!this.capturing) {
-        return;
-      }
-      const input = event.inputBuffer.getChannelData(0);
-      try {
-        const pcm = this.convertFloat32ToInt16(input);
-        callbacks.onChunk(pcm);
-      } catch (error) {
-        console.error('[mic] failed to deliver audio chunk', error);
-      }
+    this.workletNode.port.onmessage = (e) => {
+      if (!this.capturing) return;
+      const float32 = e.data as Float32Array;
+      const pcm16 = this.downsampleTo16k(float32, this.ctx!.sampleRate);
+      const buf = this.convertFloat32ToInt16(pcm16);
+      callbacks.onChunk(buf);
     };
-
-    this.source = context.createMediaStreamSource(this.mediaStream);
-    this.gain = context.createGain();
-    this.gain.gain.value = 0;
-
-    this.source.connect(this.processor);
-    this.processor.connect(this.gain);
-    this.gain.connect(context.destination);
 
     this.capturing = true;
     this.callbacks = callbacks;
-    setMicStatus('recording');
-    console.info('[mic] recording started');
+
+    await this.ctx.resume();
+    await callbacks.onReady({ sampleRate: this.targetRate });
+
+    store.setMicStatus("recording");
+    console.info("[mic] 🎙️ recording started, sr=", this.ctx.sampleRate);
   }
 
   stop(): void {
-    if (!this.capturing && !this.mediaStream) {
-      return;
-    }
-    console.info('[mic] stopping recorder');
+    if (!this.capturing) return;
+    console.info("[mic] ⏹ stop");
     this.capturing = false;
+
     try {
-      this.processor?.disconnect();
-      this.gain?.disconnect();
-      this.source?.disconnect();
-    } catch (error) {
-      console.warn('[mic] disconnect error', error);
+      this.workletNode?.disconnect();
+      this.mediaStream?.getTracks().forEach((t) => t.stop());
+      this.ctx?.close();
+    } catch (err) {
+      console.warn("[mic] stop err", err);
     }
-    if (this.mediaStream) {
-      for (const track of this.mediaStream.getTracks()) {
-        track.stop();
-      }
-    }
-    void this.audioContext?.close();
-    this.processor = null;
-    this.source = null;
+
+    this.ctx = null;
+    this.workletNode = null;
     this.mediaStream = null;
-    this.audioContext = null;
-    this.gain = null;
     this.callbacks?.onStop?.();
     this.callbacks = null;
+
     const store = useSessionStore.getState();
-    if (store.micStatus !== 'error') {
-      store.setMicStatus('idle');
+    if (store.micStatus !== "error") store.setMicStatus("idle");
+  }
+
+  private downsampleTo16k(input: Float32Array, fromRate: number): Float32Array {
+    if (fromRate === this.targetRate) return input;
+    const ratio = fromRate / this.targetRate;
+    const outLen = Math.round(input.length / ratio);
+    const out = new Float32Array(outLen);
+    let pos = 0, idx = 0;
+    while (pos < outLen) {
+      const nextIdx = Math.round((pos + 1) * ratio);
+      let sum = 0, count = 0;
+      for (let i = idx; i < nextIdx && i < input.length; i++) {
+        sum += input[i]; count++;
+      }
+      out[pos++] = sum / count;
+      idx = nextIdx;
     }
+    return out;
   }
 
   private convertFloat32ToInt16(buffer: Float32Array): ArrayBuffer {
-    const len = buffer.length;
-    const out = new ArrayBuffer(len * 2);
+    const out = new ArrayBuffer(buffer.length * 2);
     const view = new DataView(out);
-    for (let i = 0; i < len; i += 1) {
-      let sample = buffer[i];
-      sample = Math.max(-1, Math.min(1, sample));
-      view.setInt16(i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+    for (let i = 0; i < buffer.length; i++) {
+      const s = Math.max(-1, Math.min(1, buffer[i]));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
     }
     return out;
   }

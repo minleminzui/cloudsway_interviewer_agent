@@ -29,71 +29,66 @@ export function useInterviewClients(apiBaseUrl: string) {
 
   // === 初始化或切换 session 时重建所有客户端 ===
   useEffect(() => {
-    if (session.sessionId === '0') {
-      console.info('[session] cleanup: sessionId=0');
-      setTtsFallbackRetry(null);
-      if (micRef.current) {
-        micRef.current.stop();
-        micRef.current = null;
-      }
+    const sid = session.sessionId;
+    const topic = session.topic;
+
+    // 若 sessionId 未准备好或重复执行，则跳过
+    if (!sid || sid === '0') {
+      console.info('[session] waiting for valid sessionId...');
       return;
     }
 
-    const currentSession = session.sessionId;
-    console.info('[session] initializing interview clients', session);
+    // 防止重复初始化相同 session
+    if (
+      agentRef.current?.sessionId === sid &&
+      asrRef.current?.sessionId === sid &&
+      ttsRef.current?.sessionId === sid
+    ) {
+      console.info('[session] skip duplicate init for sid=', sid);
+      return;
+    }
 
-    // 防止旧连接未关闭
+    console.info('[session] init clients', { sid, topic });
+
+    // 清理旧实例
     agentRef.current?.close?.();
     asrRef.current?.close?.();
     ttsRef.current?.close?.();
 
-    // === 创建新客户端 ===
-    const agent = new AgentClient(apiBaseUrl, currentSession, session.topic);
-    const asr = new AsrClient(apiBaseUrl, currentSession);
-    const tts = new TtsClient(apiBaseUrl, currentSession);
-    console.info('[interview] init clients', session);
+    const agent = new AgentClient(apiBaseUrl, sid, topic);
+    const asr = new AsrClient(apiBaseUrl, sid);
+    const tts = new TtsClient(apiBaseUrl, sid);
+
+    // 保存 sessionId 到实例上用于防重入判断
+    (agent as any).sessionId = sid;
+    (asr as any).sessionId = sid;
+    (tts as any).sessionId = sid;
 
     agentRef.current = agent;
     asrRef.current = asr;
     ttsRef.current = tts;
 
-    // === 建立 WebSocket ===
-    try {
-      agent.connect();
-      asr.connect();
-      tts.connect();
-      console.info('[clients] all websocket connections started');
-    } catch (err) {
-      console.error('[clients] failed to connect websockets', err);
-    }
+    (async () => {
+      try {
+        await Promise.all([tts.connect(), asr.connect(), agent.connect()]);
+        console.info('[clients] ✅ all websocket connections started for sid', sid);
+      } catch (err) {
+        console.error('[clients] ❌ websocket connection error', err);
+      }
+    })();
 
     setTtsFallbackRetry(() => () => ttsRef.current?.retryFallbackSpeech());
 
-    // === 清理逻辑 ===
     return () => {
-      const sidToClose = currentSession;
-      console.info(`[session] cleaning up interview clients for sid=${sidToClose}`);
-
-      setTimeout(() => {
-        // ✅ 使用 TtsClient 公有方法 getSessionId() 来避免访问 private
-        const currentTtsId = ttsRef.current?.getSessionId?.();
-        if (currentTtsId === sidToClose) {
-          try {
-            micRef.current?.stop?.();
-            agentRef.current?.close?.();
-            asrRef.current?.close?.();
-            ttsRef.current?.close?.();
-            setTtsFallbackRetry(null);
-            console.info(`[session] closed all ws for sid=${sidToClose}`);
-          } catch (e) {
-            console.warn(`[session] cleanup error for sid=${sidToClose}`, e);
-          }
-        } else {
-          console.debug(`[session] skip cleanup (current=${currentTtsId}, old=${sidToClose})`);
-        }
-      }, 1000);
+      console.info(`[session] cleanup sid=${sid}`);
+      micRef.current?.stop();
+      agent.close();
+      asr.close();
+      tts.close();
+      setTtsFallbackRetry(null);
     };
   }, [apiBaseUrl, session.sessionId, session.topic, setTtsFallbackRetry]);
+
 
   // === 停止麦克风 ===
   const stopMicrophone = useCallback(() => {
@@ -124,36 +119,27 @@ export function useInterviewClients(apiBaseUrl: string) {
       setMicStatus('error');
       return;
     }
-    if (micStatus === 'starting' || micStatus === 'recording') {
-      console.info('[mic] start requested while already active');
-      return;
-    }
-    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
-      setMicStatus('error');
-      setMicError('浏览器不支持麦克风');
-      return;
-    }
-    if (!micRef.current) {
-      micRef.current = new MicRecorder();
-    }
+    if (micStatus === 'starting' || micStatus === 'recording') return;
+  
+    if (!micRef.current) micRef.current = new MicRecorder();
     setMicError(null);
-
+  
     try {
       await micRef.current.start({
         onReady: async ({ sampleRate }) => {
-          console.info('[mic] ready, preparing ASR stream', { sampleRate });
+          console.info('[mic] ready, starting ASR stream', sampleRate);
           asrRef.current?.startStreaming(sampleRate, 'zh-CN');
         },
         onChunk: (chunk) => {
           asrRef.current?.sendAudioChunk(chunk);
         },
         onStop: () => {
-          console.info('[mic] recorder stopped callback');
+          console.info('[mic] stopped callback');
           asrRef.current?.stopStreaming();
         },
       });
-    } catch (error) {
-      console.error('[mic] failed to start microphone', error);
+    } catch (err) {
+      console.error('[mic] start failed', err);
       setMicError('无法访问麦克风');
       setMicStatus('error');
     }

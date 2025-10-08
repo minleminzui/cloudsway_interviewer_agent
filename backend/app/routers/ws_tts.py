@@ -1,48 +1,47 @@
 # app/routers/ws_tts.py
 from __future__ import annotations
-
-import logging
-import contextlib
+import logging, contextlib
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
-from ..core.ws_tts_manager import manager
+from ..core.ws_tts_manager import manager as local_tts_manager
+from ..utils.ws_manager import WebSocketManager
 
 router = APIRouter()
 LOGGER = logging.getLogger(__name__)
 
+# 本地兜底（运行时由 app.state.ws_manager 覆盖）
+manager = WebSocketManager()
+
 
 @router.websocket("/ws/tts")
 async def websocket_tts(websocket: WebSocket) -> None:
-    """Handle TTS WebSocket connections from frontend."""
+    await websocket.accept()   # ✅ 必须加上这一行
     session_id = websocket.query_params.get("session") or "default"
-    LOGGER.info(f"[ws_tts] 🔵 Incoming TTS websocket connection sid={session_id}")
+    mgr: WebSocketManager = getattr(websocket.app.state, "ws_manager", manager)
+    LOGGER.info(f"[tts] 🔵 connected sid={session_id}")
 
     try:
-        await manager.register(session_id, websocket)
-    except WebSocketDisconnect as exc:
-        LOGGER.warning(f"[ws_tts] ⚠️ TTS websocket disconnected early sid={session_id}, code={exc.code}")
-        with contextlib.suppress(Exception):
-            await manager.unregister(session_id, websocket)
-        with contextlib.suppress(Exception):
-            await websocket.close()
-        return
-    except Exception as e:
-        LOGGER.exception(f"[ws_tts] ❌ Registration failed sid={session_id}: {e}")
-        await manager.unregister(session_id, websocket)
-        with contextlib.suppress(Exception):
-            await websocket.close()
-        raise
+        # ⚠️ 不要再 accept，这个在 ws_tts_manager.register 里会自动 accept
+        await local_tts_manager.register(session_id, websocket)
 
-    LOGGER.info(f"[ws_tts] ✅ Registered sid={session_id}, start receiving loop")
-    try:
+        # ✅ 通知全局 manager：TTS ready
+        await mgr.notify_ready(session_id, "tts")
+        LOGGER.info(f"[tts] ✅ ready sid={session_id}")
+
+        # 循环监听客户端消息（如心跳）
         while True:
             msg = await websocket.receive_text()
-            LOGGER.debug(f"[ws_tts] ↩️ Received inbound msg sid={session_id}: {msg[:100]}")
-    except WebSocketDisconnect as exc:
-        LOGGER.info(f"[ws_tts] 🔴 WebSocket closed sid={session_id}, code={exc.code}")
-        await manager.unregister(session_id, websocket)
+            LOGGER.debug(f"[tts] ↩️ msg sid={session_id}: {msg[:100]}")
+    except WebSocketDisconnect:
+        LOGGER.info(f"[tts] 🔴 disconnected sid={session_id}")
     except Exception as e:
-        LOGGER.exception(f"[ws_tts] ❌ Error in receive loop sid={session_id}: {e}")
-        await manager.unregister(session_id, websocket)
+        LOGGER.exception(f"[tts] ❌ error sid={session_id}: {e}")
+    finally:
         with contextlib.suppress(Exception):
-            await websocket.close()
+            await local_tts_manager.unregister(session_id, websocket)
+        await mgr.disconnect(session_id)
+        if websocket.client_state != WebSocketState.DISCONNECTED:
+            with contextlib.suppress(Exception):
+                await websocket.close()
+        LOGGER.info(f"[tts] 🧹 cleaned sid={session_id}")

@@ -1,3 +1,4 @@
+// frontend/src/pages/MainConsole.tsx
 import '../App.css';
 import { OutlinePanel } from '../components/OutlinePanel';
 import { PendingClarify } from '../components/PendingClarify';
