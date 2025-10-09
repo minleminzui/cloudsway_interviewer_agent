@@ -1,4 +1,4 @@
-// src/hooks/useInterviewClients.ts
+// frontend/src/hooks/useInterviewClients.ts
 import { useCallback, useEffect, useRef } from 'react';
 import { AgentClient } from '../api/agentClient';
 import { AsrClient } from '../api/asrClient';
@@ -6,10 +6,6 @@ import { TtsClient } from '../api/ttsClient';
 import { useSessionStore } from '../store/useSessionStore';
 import { MicRecorder } from '../audio/MicRecorder';
 
-/**
- * 管理语音面试过程中的主要客户端：
- * Agent（智能体）、ASR（语音识别）、TTS（语音合成）、Mic（麦克风录制）
- */
 export function useInterviewClients(apiBaseUrl: string) {
   const session = useSessionStore((state) => ({
     sessionId: state.sessionId,
@@ -27,18 +23,15 @@ export function useInterviewClients(apiBaseUrl: string) {
   const micRef = useRef<MicRecorder | null>(null);
   const pendingStopRef = useRef(false);
 
-  // === 初始化或切换 session 时重建所有客户端 ===
   useEffect(() => {
     const sid = session.sessionId;
     const topic = session.topic;
 
-    // 若 sessionId 未准备好或重复执行，则跳过
     if (!sid || sid === '0') {
       console.info('[session] waiting for valid sessionId...');
       return;
     }
 
-    // 防止重复初始化相同 session
     if (
       agentRef.current?.sessionId === sid &&
       asrRef.current?.sessionId === sid &&
@@ -50,7 +43,6 @@ export function useInterviewClients(apiBaseUrl: string) {
 
     console.info('[session] init clients', { sid, topic });
 
-    // 清理旧实例
     agentRef.current?.close?.();
     asrRef.current?.close?.();
     ttsRef.current?.close?.();
@@ -59,7 +51,6 @@ export function useInterviewClients(apiBaseUrl: string) {
     const asr = new AsrClient(apiBaseUrl, sid);
     const tts = new TtsClient(apiBaseUrl, sid);
 
-    // 保存 sessionId 到实例上用于防重入判断
     (agent as any).sessionId = sid;
     (asr as any).sessionId = sid;
     (tts as any).sessionId = sid;
@@ -89,8 +80,6 @@ export function useInterviewClients(apiBaseUrl: string) {
     };
   }, [apiBaseUrl, session.sessionId, session.topic, setTtsFallbackRetry]);
 
-
-  // === 停止麦克风 ===
   const stopMicrophone = useCallback(() => {
     if (!micRef.current || pendingStopRef.current) return;
     pendingStopRef.current = true;
@@ -99,15 +88,12 @@ export function useInterviewClients(apiBaseUrl: string) {
       micRef.current.stop();
       asrRef.current?.stopStreaming();
       const store = useSessionStore.getState();
-      if (store.micStatus !== 'error') {
-        setMicError(null);
-      }
+      if (store.micStatus !== 'error') setMicError(null);
     } finally {
       pendingStopRef.current = false;
     }
   }, [setMicError]);
 
-  // === 启动麦克风 ===
   const startMicrophone = useCallback(async () => {
     if (session.sessionId === '0') {
       setMicError('请先创建会话');
@@ -120,10 +106,10 @@ export function useInterviewClients(apiBaseUrl: string) {
       return;
     }
     if (micStatus === 'starting' || micStatus === 'recording') return;
-  
+
     if (!micRef.current) micRef.current = new MicRecorder();
     setMicError(null);
-  
+
     try {
       await micRef.current.start({
         onReady: async ({ sampleRate }) => {
@@ -133,9 +119,18 @@ export function useInterviewClients(apiBaseUrl: string) {
         onChunk: (chunk) => {
           asrRef.current?.sendAudioChunk(chunk);
         },
-        onStop: () => {
+        onStop: (previewUrl, durationMs) => {
           console.info('[mic] stopped callback');
           asrRef.current?.stopStreaming();
+          if (previewUrl) {
+            const store = useSessionStore.getState();
+            store.addTranscript?.({
+              speaker: 'user',
+              text: '[语音]',
+              audioUrl: previewUrl,
+              durationMs,               // ← 可选：时长回显
+            } as any);                   // 如果你给 TranscriptEntry 加了可扩展字段就不需要 as any
+          }
         },
       });
     } catch (err) {

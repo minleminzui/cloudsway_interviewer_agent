@@ -291,3 +291,31 @@ main {
   outline: 2px solid #1e3a8a;
   outline-offset: 2px;
 }
+
+
+.transcript-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 8px 0;
+}
+.msg {
+  display: flex;
+}
+.msg.user { justify-content: flex-start; }
+.msg.agent { justify-content: flex-end; }
+
+.bubble {
+  max-width: 520px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0,0,0,.06);
+}
+.bubble.text { white-space: pre-wrap; }
+.bubble.audio { background: #f7fbff; }
+.meta {
+  font-size: 12px;
+  color: #667085;
+  margin-bottom: 6px;
+}

@@ -1,3 +1,4 @@
+// frontend/src/api/asrClient.ts
 import ReconnectingWebSocket from 'reconnecting-websocket';
 import { useSessionStore } from '../store/useSessionStore';
 
@@ -13,18 +14,17 @@ export class AsrClient {
   private lastStartPayload: any = null;
   private heartbeatTimer: any = null;
 
-  constructor(
-    public baseUrl: string,
-    public sessionId: string
-  ) {}
+  constructor(public baseUrl: string, public sessionId: string) {}
 
   connect() {
     const wsUrl = `${this.baseUrl.replace('http', 'ws')}/ws/asr?session=${this.sessionId}`;
     this.socket = new ReconnectingWebSocket(wsUrl, [], WS_OPTIONS);
 
+    // ✨ 确保底层以 ArrayBuffer 发送二进制
+    (this.socket as any).binaryType = 'arraybuffer';
+
     this.socket.addEventListener('open', () => {
       console.info('[asr] websocket connected');
-      // 🔄 自动恢复 streaming 状态
       if (this.isStreaming && this.lastStartPayload) {
         console.info('[asr] restoring stream after reconnect');
         this._sendJSON(this.lastStartPayload);
@@ -48,7 +48,7 @@ export class AsrClient {
     try {
       data = JSON.parse(raw);
     } catch {
-      console.warn('[asr] non-JSON message ignored');
+      // 忽略纯二进制
       return;
     }
 
@@ -58,6 +58,7 @@ export class AsrClient {
         console.info('[asr] handshake payload', data.payload);
         break;
       case 'asr_partial':
+        // 可在 UI 顶部做“正在听写：xxx”的回显（看你 store 的结构，这里简单打印）
         console.debug('[asr] partial transcript', data.text);
         break;
       case 'asr_final':
@@ -82,8 +83,12 @@ export class AsrClient {
 
   private async _sendWhenReady(data: string | ArrayBuffer) {
     if (!this.socket) return;
-    if (this.socket.readyState === WebSocket.OPEN) {
-      this.socket.send(data);
+  
+    // 用浏览器 WebSocket 的签名做一次断言，避免 ReconnectingWebSocket 的 Node 类型约束
+    const sock = this.socket as unknown as WebSocket;
+  
+    if (sock.readyState === WebSocket.OPEN) {
+      sock.send(data);
     } else {
       await new Promise<void>((resolve) => {
         const onOpen = () => {
@@ -92,10 +97,10 @@ export class AsrClient {
         };
         this.socket?.addEventListener('open', onOpen);
       });
-      this.socket?.send(data);
+      (this.socket as unknown as WebSocket).send(data);
     }
   }
-
+  
   private _sendJSON(obj: any) {
     void this._sendWhenReady(JSON.stringify(obj));
   }

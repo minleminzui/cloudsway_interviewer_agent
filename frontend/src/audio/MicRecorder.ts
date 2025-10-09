@@ -2,21 +2,21 @@ import { useSessionStore } from "../store/useSessionStore";
 
 export type MicCallbacks = {
   onReady: (info: { sampleRate: number }) => Promise<void> | void;
-  onChunk: (chunk: ArrayBuffer) => void;
-  onStop?: () => void;
+  onChunk: (chunk: ArrayBuffer) => void; // ✅ 用 ArrayBuffer
+  onStop?: (previewUrl?: string, durationMs?: number) => void;
 };
 
-/**
- * 🔊 改进版 MicRecorder
- * - 使用 AudioWorkletProcessor（Edge / Chrome 均稳定）
- * - 实时推流 16kHz PCM16
- */
 export class MicRecorder {
   private ctx: AudioContext | null = null;
   private workletNode: AudioWorkletNode | null = null;
   private mediaStream: MediaStream | null = null;
+  private mediaRecorder: MediaRecorder | null = null;   // ← 用来生成可回显音频
+  private previewChunks: BlobPart[] = [];
+  private startTs: number | null = null;
+
   private capturing = false;
   private callbacks: MicCallbacks | null = null;
+
   private targetRate = 16000;
 
   async start(callbacks: MicCallbacks): Promise<void> {
@@ -41,7 +41,7 @@ export class MicRecorder {
       throw err;
     }
 
-    // 🔹 创建 AudioContext + 加载 Worklet
+    // == 播放管线（AudioWorklet） ==
     this.ctx = new AudioContext({ sampleRate: 48000 });
     await this.ctx.audioWorklet.addModule(
       URL.createObjectURL(
@@ -59,7 +59,7 @@ export class MicRecorder {
                 if (!ch) return true;
                 const now = currentTime;
                 this._buf.push(new Float32Array(ch));
-                if (now - this._lastSend > 0.2) { // 每200ms推一次
+                if (now - this._lastSend > 0.2) { // 每 200ms 推一次
                   const merged = this._merge();
                   this.port.postMessage(merged);
                   this._buf = [];
@@ -86,15 +86,46 @@ export class MicRecorder {
     const src = this.ctx.createMediaStreamSource(this.mediaStream);
     this.workletNode = new AudioWorkletNode(this.ctx, "mic-processor");
     src.connect(this.workletNode);
-    this.workletNode.connect(this.ctx.destination);
+    // 避免外放，可不连到 destination；如需耳返就保留下一行
+    // this.workletNode.connect(this.ctx.destination);
 
+    // 把 48k Float32 降采样到 16k PCM16，推给 ASR
     this.workletNode.port.onmessage = (e) => {
       if (!this.capturing) return;
       const float32 = e.data as Float32Array;
       const pcm16 = this.downsampleTo16k(float32, this.ctx!.sampleRate);
-      const buf = this.convertFloat32ToInt16(pcm16);
+      const buf = this.convertFloat32ToInt16(pcm16); // ← 这是 ArrayBuffer
       callbacks.onChunk(buf);
     };
+
+    // == 回显录音（MediaRecorder） ==
+    // Edge/Chrome 均支持；若失败会自动跳过回显功能
+    try {
+      this.mediaRecorder = new MediaRecorder(this.mediaStream, { mimeType: 'audio/webm' });
+      this.previewChunks = [];
+      this.mediaRecorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) this.previewChunks.push(ev.data);
+      };
+      this.mediaRecorder.onstart = () => {
+        this.startTs = Date.now();
+      };
+      this.mediaRecorder.onstop = () => {
+        try {
+          const blob = new Blob(this.previewChunks, { type: 'audio/webm' });
+          const url = URL.createObjectURL(blob);
+          const durationMs = this.startTs ? Date.now() - this.startTs : undefined;
+          this.callbacks?.onStop?.(url, durationMs);
+        } catch {
+          this.callbacks?.onStop?.();
+        } finally {
+          this.previewChunks = [];
+          this.startTs = null;
+        }
+      };
+      this.mediaRecorder.start(200); // 每 200ms 切片
+    } catch (e) {
+      console.warn("[mic] MediaRecorder unavailable, skip preview", e);
+    }
 
     this.capturing = true;
     this.callbacks = callbacks;
@@ -112,6 +143,13 @@ export class MicRecorder {
     this.capturing = false;
 
     try {
+      // 先停回显
+      if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+        this.mediaRecorder.stop();
+      } else {
+        // 没有回显能力也要回调一次
+        this.callbacks?.onStop?.();
+      }
       this.workletNode?.disconnect();
       this.mediaStream?.getTracks().forEach((t) => t.stop());
       this.ctx?.close();
@@ -122,8 +160,7 @@ export class MicRecorder {
     this.ctx = null;
     this.workletNode = null;
     this.mediaStream = null;
-    this.callbacks?.onStop?.();
-    this.callbacks = null;
+    this.mediaRecorder = null;
 
     const store = useSessionStore.getState();
     if (store.micStatus !== "error") store.setMicStatus("idle");

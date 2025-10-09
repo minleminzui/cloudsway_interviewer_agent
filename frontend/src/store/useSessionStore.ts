@@ -1,14 +1,32 @@
 import { create } from 'zustand';
 
-type TranscriptEntry = {
-  speaker: 'agent' | 'user';
+export type TranscriptEntry = {
+  speaker: 'user' | 'agent';
   text: string;
+  audioUrl?: string;     // 新增
+  durationMs?: number;   // 可选：展示时长
+};
+
+type State = {
+  sessionId: string;
+  topic: string;
+  transcript: TranscriptEntry[];
+  micStatus: 'idle' | 'starting' | 'recording' | 'error';
+  micError: string | null;
+
+  addTranscript: (entry: TranscriptEntry) => void;
+  setMicStatus: (s: State['micStatus']) => void;
+  setMicError: (e: string | null) => void;
+
+  // 你原先就有的 TTS 相关：
+  setTtsFallbackRetry: (fn: (() => void) | null) => void;
 };
 
 type OutlineSection = {
   stage: string;
   questions: string[];
 };
+
 
 type NoteEntry = {
   category: string;
@@ -72,7 +90,7 @@ export const useSessionStore = create<SessionState>((set) => ({
   micError: null,
   setSession: ({ sessionId, topic }) => set(() => ({ sessionId, topic })),
   setOutline: (sections) => set(() => ({ outline: sections })),
-  addTranscript: (entry) => set((state) => ({ transcript: [...state.transcript, entry] })),
+  addTranscript: (entry: TranscriptEntry) => set((state) => ({ transcript: [...state.transcript, entry] })),
   setPendingQuestion: (question) => set(() => ({ pendingQuestion: question })),
   setStage: (stage) => set(() => ({ stage })),
   updateNotes: (incoming) =>

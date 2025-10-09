@@ -2,7 +2,7 @@
 import '../App.css';
 import { OutlinePanel } from '../components/OutlinePanel';
 import { PendingClarify } from '../components/PendingClarify';
-import { TranscriptPane } from '../components/TranscriptPane';
+import TranscriptPane from '../components/TranscriptPane';
 import { ControlBar } from '../components/ControlBar';
 import { useBootstrapSession } from '../hooks/useBootstrapSession';
 import { useSessionStore } from '../store/useSessionStore';
