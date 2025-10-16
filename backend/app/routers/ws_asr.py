@@ -188,18 +188,14 @@ async def _relay_to_volc(session_id: str, websocket: WebSocket, mgr: WebSocketMa
                                 if not text:
                                     continue
                                 definite = utt.get("definite") or utt.get("is_final")
-                                LOGGER.info(
-                                    f"[ASR] 🗣️ recv text={text!r} definite={definite} sid={session_id}"
-                                )
-
                                 if not definite:
                                     await mgr.send_json(session_id, {"type": "asr_partial", "text": text})
                                 else:
                                     await mgr.send_json(session_id, {"type": "asr_final", "text": text})
-                                    LOGGER.info(f"[ASR] 🚀 dispatch query to agent sid={session_id}")
                                     await mgr.send_json(session_id, {"type": "query", "text": text})
                 except Exception:
                     LOGGER.exception("[ASR] volc_recv failed")
+
 
             recv_task = asyncio.create_task(volc_recv())
 

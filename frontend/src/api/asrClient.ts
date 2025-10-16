@@ -1,11 +1,12 @@
-// frontend/src/api/asrClient.ts
 import ReconnectingWebSocket from 'reconnecting-websocket';
 import { useSessionStore } from '../store/useSessionStore';
 
-const WS_OPTIONS = {
-  maxReconnectionDelay: 4000,
-  minReconnectionDelay: 250,
-  reconnectionDelayGrowFactor: 1.5,
+const WS_OPTIONS = { maxReconnectionDelay: 4000, minReconnectionDelay: 250, reconnectionDelayGrowFactor: 1.5 };
+
+export type AsrClientCallbacks = {
+  onPartial?: (text: string) => void;
+  onFinal?: (text: string) => void;
+  onError?: (msg: string) => void;
 };
 
 export class AsrClient {
@@ -14,14 +15,15 @@ export class AsrClient {
   private lastStartPayload: any = null;
   private heartbeatTimer: any = null;
 
-  constructor(public baseUrl: string, public sessionId: string) {}
+  constructor(
+    public baseUrl: string,
+    public sessionId: string,
+    private cbs: AsrClientCallbacks = {}
+  ) {}
 
   connect() {
     const wsUrl = `${this.baseUrl.replace('http', 'ws')}/ws/asr?session=${this.sessionId}`;
     this.socket = new ReconnectingWebSocket(wsUrl, [], WS_OPTIONS);
-
-    // ✨ 确保底层以 ArrayBuffer 发送二进制
-    (this.socket as any).binaryType = 'arraybuffer';
 
     this.socket.addEventListener('open', () => {
       console.info('[asr] websocket connected');
@@ -45,12 +47,7 @@ export class AsrClient {
 
   private _handleMessage(raw: any) {
     let data: any;
-    try {
-      data = JSON.parse(raw);
-    } catch {
-      // 忽略纯二进制
-      return;
-    }
+    try { data = JSON.parse(raw); } catch { return; }
 
     const store = useSessionStore.getState();
     switch (data.type) {
@@ -58,49 +55,45 @@ export class AsrClient {
         console.info('[asr] handshake payload', data.payload);
         break;
       case 'asr_partial':
-        // 可在 UI 顶部做“正在听写：xxx”的回显（看你 store 的结构，这里简单打印）
-        console.debug('[asr] partial transcript', data.text);
+        store.setAsrPartial?.(data.text ?? '');
+        this.cbs.onPartial?.(data.text ?? '');
         break;
       case 'asr_final':
         store.addTranscript({ speaker: 'user', text: data.text });
-        console.info('[asr] final transcript', data.text);
+        store.setAsrPartial?.('');
+        this.cbs.onFinal?.(data.text ?? '');
         break;
       case 'asr_error':
         console.error('[asr] backend error', data.message);
-        store.setMicStatus('error');
-        store.setMicError(data.message ?? '识别失败');
+        store.setMicStatus?.('error');
+        store.setMicError?.(data.message ?? '识别失败');
         this.isStreaming = false;
+        this.cbs.onError?.(data.message ?? '识别失败');
         break;
       case 'asr_stopped':
         console.info('[asr] backend confirmed stop');
         this.isStreaming = false;
-        store.setMicStatus('idle');
+        store.setMicStatus?.('idle');
         break;
       default:
-        console.debug('[asr] unknown message type', data);
+        // ignore
     }
   }
 
   private async _sendWhenReady(data: string | ArrayBuffer) {
     if (!this.socket) return;
-  
-    // 用浏览器 WebSocket 的签名做一次断言，避免 ReconnectingWebSocket 的 Node 类型约束
     const sock = this.socket as unknown as WebSocket;
-  
     if (sock.readyState === WebSocket.OPEN) {
       sock.send(data);
     } else {
       await new Promise<void>((resolve) => {
-        const onOpen = () => {
-          this.socket?.removeEventListener('open', onOpen);
-          resolve();
-        };
+        const onOpen = () => { this.socket?.removeEventListener('open', onOpen); resolve(); };
         this.socket?.addEventListener('open', onOpen);
       });
       (this.socket as unknown as WebSocket).send(data);
     }
   }
-  
+
   private _sendJSON(obj: any) {
     void this._sendWhenReady(JSON.stringify(obj));
   }
@@ -110,10 +103,7 @@ export class AsrClient {
   }
 
   startStreaming(sampleRate: number, language: string) {
-    if (!this.socket) {
-      console.warn('[asr] cannot start streaming before socket initialises');
-      return;
-    }
+    if (!this.socket) return;
     const payload = { type: 'start', sampleRate, language };
     this.lastStartPayload = payload;
     this.isStreaming = true;
@@ -136,7 +126,7 @@ export class AsrClient {
   private _startHeartbeat() {
     this._stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
-      if (this.socket?.readyState === WebSocket.OPEN) {
+      if ((this.socket as unknown as WebSocket)?.readyState === WebSocket.OPEN) {
         this._sendJSON({ type: 'ping' });
       }
     }, 5000);

@@ -48,7 +48,18 @@ export function useInterviewClients(apiBaseUrl: string) {
     ttsRef.current?.close?.();
 
     const agent = new AgentClient(apiBaseUrl, sid, topic);
-    const asr = new AsrClient(apiBaseUrl, sid);
+    // 🔗 关键：asr 识别完成后 => 立刻发给 agent
+    const asr = new AsrClient(apiBaseUrl, sid, {
+      onFinal: (text) => {
+        agentRef.current?.sendUserTurn(text);
+      },
+      onPartial: (text) => {
+        const store = useSessionStore.getState();
+        store.setAsrPartial?.(text);
+      },
+    });
+    asrRef.current = asr;
+
     const tts = new TtsClient(apiBaseUrl, sid);
 
     (agent as any).sessionId = sid;
@@ -57,7 +68,7 @@ export function useInterviewClients(apiBaseUrl: string) {
 
     agentRef.current = agent;
     asrRef.current = asr;
-    ttsRef.current = tts;
+    ttsRef.current = tts;    
 
     (async () => {
       try {
@@ -76,6 +87,7 @@ export function useInterviewClients(apiBaseUrl: string) {
       agent.close();
       asr.close();
       tts.close();
+      asrRef.current?.close();
       setTtsFallbackRetry(null);
     };
   }, [apiBaseUrl, session.sessionId, session.topic, setTtsFallbackRetry]);
@@ -111,6 +123,7 @@ export function useInterviewClients(apiBaseUrl: string) {
     setMicError(null);
 
     try {
+      if (!micRef.current) micRef.current = new MicRecorder();
       await micRef.current.start({
         onReady: async ({ sampleRate }) => {
           console.info('[mic] ready, starting ASR stream', sampleRate);
@@ -119,17 +132,12 @@ export function useInterviewClients(apiBaseUrl: string) {
         onChunk: (chunk) => {
           asrRef.current?.sendAudioChunk(chunk);
         },
-        onStop: (previewUrl, durationMs) => {
+        onStop: (previewUrl?: string) => {
           console.info('[mic] stopped callback');
           asrRef.current?.stopStreaming();
           if (previewUrl) {
             const store = useSessionStore.getState();
-            store.addTranscript?.({
-              speaker: 'user',
-              text: '[语音]',
-              audioUrl: previewUrl,
-              durationMs,               // ← 可选：时长回显
-            } as any);                   // 如果你给 TranscriptEntry 加了可扩展字段就不需要 as any
+            store.addTranscript?.({ speaker: 'user', text: '[语音]', audioUrl: previewUrl });
           }
         },
       });

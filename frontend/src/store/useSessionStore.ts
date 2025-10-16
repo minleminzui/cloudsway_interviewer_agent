@@ -7,21 +7,6 @@ export type TranscriptEntry = {
   durationMs?: number;   // 可选：展示时长
 };
 
-type State = {
-  sessionId: string;
-  topic: string;
-  transcript: TranscriptEntry[];
-  micStatus: 'idle' | 'starting' | 'recording' | 'error';
-  micError: string | null;
-
-  addTranscript: (entry: TranscriptEntry) => void;
-  setMicStatus: (s: State['micStatus']) => void;
-  setMicError: (e: string | null) => void;
-
-  // 你原先就有的 TTS 相关：
-  setTtsFallbackRetry: (fn: (() => void) | null) => void;
-};
-
 type OutlineSection = {
   stage: string;
   questions: string[];
@@ -52,6 +37,9 @@ type SessionState = {
   ttsError: string | null;
   ttsFallbackText: string | null;
   ttsFallbackNeedUserAction: boolean;
+  asrPartial: string;
+  setAsrPartial: (t: string) => void;
+
   ttsFallbackRetry: (() => void) | null;
   micStatus: MicStatus;
   micError: string | null;
@@ -88,9 +76,13 @@ export const useSessionStore = create<SessionState>((set) => ({
   ttsFallbackRetry: null,
   micStatus: 'idle',
   micError: null,
+  asrPartial: '',
+  addTranscript: (entry: TranscriptEntry) =>
+    set((s) => ({ transcript: [...s.transcript, entry] })),
+
+  setAsrPartial: (t) => set({ asrPartial: t }),
   setSession: ({ sessionId, topic }) => set(() => ({ sessionId, topic })),
   setOutline: (sections) => set(() => ({ outline: sections })),
-  addTranscript: (entry: TranscriptEntry) => set((state) => ({ transcript: [...state.transcript, entry] })),
   setPendingQuestion: (question) => set(() => ({ pendingQuestion: question })),
   setStage: (stage) => set(() => ({ stage })),
   updateNotes: (incoming) =>

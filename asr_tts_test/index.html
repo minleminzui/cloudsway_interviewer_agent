@@ -1,0 +1,58 @@
+<script>
+  (() => {
+    const WS_URL = 'ws://127.0.0.1:8765/asr';
+    let ws, ctx, source, proc, sending=false;
+  
+    function float32ToInt16PCM(float32) {
+      const out = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        let s = Math.max(-1, Math.min(1, float32[i]));
+        out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      }
+      return out;
+    }
+  
+    async function start() {
+      // 1) 先开音频设备
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {echoCancellation:true, noiseSuppression:true, autoGainControl:true, channelCount:1}
+      });
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const bufferSize = 2048;
+      source = ctx.createMediaStreamSource(stream);
+      proc = ctx.createScriptProcessor(bufferSize, 1, 1);
+  
+      // 2) 再建 WS（避免页面阻塞时服务端等待过久）
+      ws = new WebSocket(WS_URL);
+      ws.binaryType = 'arraybuffer';
+  
+      ws.onopen = () => {
+        // 发送 start，带采样率
+        ws.send(JSON.stringify({type:'start', sampleRate: ctx.sampleRate, language:'zh-CN'}));
+        sending = true;
+        // 只有在 WS open 后才挂载音频回调，避免 race
+        proc.onaudioprocess = (e) => {
+          if (!sending || ws.readyState !== WebSocket.OPEN) return;
+          const i16 = float32ToInt16PCM(e.inputBuffer.getChannelData(0));
+          ws.send(i16.buffer);
+        };
+        source.connect(proc);
+        proc.connect(ctx.destination);
+      };
+  
+      ws.onmessage = (ev) => { /* 保持你之前的 UI 刷新逻辑即可 */ };
+      ws.onerror = () => { /* 显示错误 */ };
+      ws.onclose = () => { /* 显示断开 */ };
+    }
+  
+    function stop() {
+      sending = false;
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type:'stop'}));
+      try{proc && proc.disconnect(); source && source.disconnect(); ctx && ctx.close();}catch{}
+      try{ws && ws.close();}catch{}
+    }
+  
+    // 绑定按钮…（保留你之前的）
+  })();
+  </script>
+  
